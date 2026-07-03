@@ -2361,6 +2361,96 @@ def test_show_config_api_version_has_chart_candles(botclient):
     assert rc.json()["api_version"] == 2.50
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"timeframe": "15m"},
+        {"pair": "XRP/BTC"},
+        {"pair": "XRP/BTC", "timeframe": "15m", "limit": 0},
+        {
+            "pair": "XRP/BTC",
+            "timeframe": "15m",
+            "watch_indicators": {"macd": [{"fast": 12, "slow": 12, "signal": 9}]},
+        },
+    ],
+)
+def test_chart_candles_schema_validation(botclient, payload):
+    _ftbot, client = botclient
+
+    rc = client_post(client, f"{BASE_URI}/chart_candles", data=payload)
+
+    assert_response(rc, 422)
+
+
+def test_api_chart_candles_success(botclient, mocker):
+    ftbot, client = botclient
+    builder_mock = mocker.patch(
+        "freqtrade.rpc.api_server.api_chart.build_chart_candles_response",
+        return_value={
+            "strategy": CURRENT_TEST_STRATEGY,
+            "pair": "XRP/BTC",
+            "timeframe": "15m",
+            "timeframe_ms": 900000,
+            "columns": ["date", "open", "high", "low", "close", "volume", "__date_ts"],
+            "all_columns": ["date", "open", "high", "low", "close", "volume"],
+            "data": [],
+            "annotations": [],
+            "length": 0,
+            "buy_signals": 0,
+            "sell_signals": 0,
+            "enter_long_signals": 0,
+            "exit_long_signals": 0,
+            "enter_short_signals": 0,
+            "exit_short_signals": 0,
+            "last_analyzed": datetime(2024, 1, 1, tzinfo=UTC),
+            "last_analyzed_ts": 1704067200000,
+            "data_start_ts": 0,
+            "data_start": "",
+            "data_stop": "",
+            "data_stop_ts": 0,
+            "chart_timeframe": "15m",
+            "strategy_timeframe": "5m",
+            "overlay": {
+                "strategy_timeframe": "5m",
+                "alignment": "direct",
+                "columns": [],
+                "hidden": False,
+                "warning": None,
+            },
+            "plot_config": {"main_plot": {}, "subplots": {}},
+            "warnings": [],
+        },
+    )
+
+    rc = client_post(
+        client,
+        f"{BASE_URI}/chart_candles",
+        data={"pair": "XRP/BTC", "timeframe": "15m", "limit": 50},
+    )
+
+    assert_response(rc)
+    response = rc.json()
+    assert response["pair"] == "XRP/BTC"
+    assert response["chart_timeframe"] == "15m"
+    assert response["plot_config"] == {"main_plot": {}, "subplots": {}}
+    assert response["overlay"] == {
+        "strategy_timeframe": "5m",
+        "alignment": "direct",
+        "columns": [],
+        "hidden": False,
+        "warning": None,
+    }
+    builder_mock.assert_called_once()
+    call_rpc, call_config, call_payload = builder_mock.call_args.args
+    assert call_rpc._freqtrade is ftbot
+    assert call_config is ftbot.config
+    assert call_payload.pair == "XRP/BTC"
+    assert call_payload.timeframe == "15m"
+    assert call_payload.limit == 50
+    assert call_payload.watch_indicators is None
+    assert call_payload.include_strategy_overlay is True
+
+
 def test_api_pair_history(botclient, tmp_path, mocker):
     _ftbot, client = botclient
     _ftbot.config["user_data_dir"] = tmp_path
