@@ -2451,6 +2451,103 @@ def test_api_chart_candles_success(botclient, mocker):
     assert call_payload.include_strategy_overlay is True
 
 
+def test_api_chart_candles_integration(botclient, mocker):
+    ftbot, client = botclient
+    ftbot.config["timeframe"] = "1h"
+    ftbot.strategy.timeframe = "1h"
+    ftbot.strategy.plot_config = {
+        "main_plot": {},
+        "subplots": {
+            "Volatility system": {
+                "atr": {},
+                "abs_close_change": {},
+            }
+        },
+    }
+    strategy_df = generate_test_data("1h", 60, "2024-01-01 00:00:00+00:00")
+    strategy_df["atr"] = strategy_df["high"] - strategy_df["low"]
+    strategy_df["abs_close_change"] = strategy_df["close"].diff().abs()
+    ftbot.dataprovider._set_cached_df("XRP/BTC", "1h", strategy_df, CandleType.SPOT)
+    mocker.patch.object(
+        ftbot.exchange,
+        "get_historic_ohlcv",
+        return_value=generate_test_data("15m", 180, "2024-01-01 00:00:00+00:00"),
+    )
+
+    rc = client_post(
+        client,
+        f"{BASE_URI}/chart_candles",
+        data={"pair": "XRP/BTC", "timeframe": "15m", "limit": 50},
+    )
+
+    assert_response(rc)
+    response = rc.json()
+    assert response["length"] == 50
+    assert response["chart_timeframe"] == "15m"
+    assert response["strategy_timeframe"] == "1h"
+    assert "watch_ma20" in response["columns"]
+    assert "watch_rsi14" in response["columns"]
+    assert "watch_macd" in response["columns"]
+    assert "strategy_1h_atr" in response["columns"]
+    assert response["overlay"]["alignment"] == "forward_fill"
+    assert response["warnings"] == []
+    assert "Volatility system" in response["plot_config"]["subplots"]
+    assert "strategy_1h_atr" in response["plot_config"]["subplots"]["Volatility system"]
+
+
+def test_api_chart_candles_excludes_strategy_overlay(botclient, mocker):
+    ftbot, client = botclient
+    ftbot.config["timeframe"] = "1h"
+    mocker.patch.object(
+        ftbot.exchange,
+        "get_historic_ohlcv",
+        return_value=generate_test_data("15m", 180, "2024-01-01 00:00:00+00:00"),
+    )
+
+    rc = client_post(
+        client,
+        f"{BASE_URI}/chart_candles",
+        data={
+            "pair": "XRP/BTC",
+            "timeframe": "15m",
+            "limit": 50,
+            "include_strategy_overlay": False,
+        },
+    )
+
+    assert_response(rc)
+    response = rc.json()
+    assert "watch_ma20" in response["columns"]
+    assert "watch_rsi14" in response["columns"]
+    assert "watch_macd" in response["columns"]
+    assert not any(column.startswith("strategy_") for column in response["columns"])
+    assert response["overlay"] is None
+
+
+@pytest.mark.parametrize(
+    "side_effect,expected_code",
+    [
+        (ValueError("bad request"), 400),
+        (RuntimeError("exchange failed"), 502),
+    ],
+)
+def test_api_chart_candles_exception_mapping(botclient, mocker, side_effect, expected_code):
+    _ftbot, client = botclient
+    mocker.patch(
+        "freqtrade.rpc.api_server.api_chart.build_chart_candles_response",
+        side_effect=side_effect,
+    )
+
+    rc = client_post(
+        client,
+        f"{BASE_URI}/chart_candles",
+        data={"pair": "XRP/BTC", "timeframe": "15m", "limit": 50},
+    )
+
+    assert_response(rc, expected_code)
+    assert rc.json()["detail"] == str(side_effect)
+
+
 def test_api_pair_history(botclient, tmp_path, mocker):
     _ftbot, client = botclient
     _ftbot.config["user_data_dir"] = tmp_path
