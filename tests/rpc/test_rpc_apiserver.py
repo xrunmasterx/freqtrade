@@ -2353,6 +2353,14 @@ def test_api_pair_candles(botclient, ohlcv_history, annotations, expected):
     ]
 
 
+def test_show_config_api_version_has_chart_candles(botclient):
+    _ftbot, client = botclient
+
+    rc = client_get(client, f"{BASE_URI}/show_config")
+    assert_response(rc)
+    assert rc.json()["api_version"] == 2.50
+
+
 def test_api_pair_history(botclient, tmp_path, mocker):
     _ftbot, client = botclient
     _ftbot.config["user_data_dir"] = tmp_path

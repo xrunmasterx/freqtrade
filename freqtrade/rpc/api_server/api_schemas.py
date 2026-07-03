@@ -596,6 +596,48 @@ class PairCandlesRequest(BaseModel):
     columns: list[str] | None = None
 
 
+class MacdIndicatorRequest(BaseModel):
+    fast: int = Field(default=12, ge=1, le=200)
+    slow: int = Field(default=26, ge=1, le=300)
+    signal: int = Field(default=9, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_period_order(self):
+        if self.slow <= self.fast:
+            raise ValueError("MACD slow period must be greater than fast period.")
+        return self
+
+
+class ChartIndicatorRequest(BaseModel):
+    ma: list[int] = Field(default_factory=lambda: [20, 60])
+    rsi: list[int] = Field(default_factory=lambda: [14])
+    macd: list[MacdIndicatorRequest] = Field(default_factory=lambda: [MacdIndicatorRequest()])
+
+    @model_validator(mode="after")
+    def validate_indicator_periods(self):
+        if any(period < 1 or period > 500 for period in self.ma):
+            raise ValueError("MA periods must be between 1 and 500.")
+        if any(period < 1 or period > 500 for period in self.rsi):
+            raise ValueError("RSI periods must be between 1 and 500.")
+        return self
+
+
+class ChartCandlesRequest(BaseModel):
+    pair: str
+    timeframe: str
+    limit: int = Field(default=500, ge=1, le=2000)
+    watch_indicators: ChartIndicatorRequest | None = None
+    include_strategy_overlay: bool = True
+
+
+class ChartOverlayMeta(BaseModel):
+    strategy_timeframe: str
+    alignment: str
+    columns: list[str] = Field(default_factory=list)
+    hidden: bool = False
+    warning: str | None = None
+
+
 class PairHistoryRequest(PairCandlesRequest, ExchangeModePayloadMixin):
     timerange: str
     strategy: str | None = None
@@ -625,6 +667,14 @@ class PairHistory(BaseModel):
     data_start: str
     data_stop: str
     data_stop_ts: int
+
+
+class ChartCandlesResponse(PairHistory):
+    chart_timeframe: str
+    strategy_timeframe: str | None = None
+    overlay: ChartOverlayMeta | None = None
+    plot_config: PlotConfig
+    warnings: list[str] = Field(default_factory=list)
 
 
 class BacktestFreqAIInputs(BaseModel):
