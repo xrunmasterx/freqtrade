@@ -7,8 +7,7 @@ from freqtrade.research.data_source import RESEARCH_OHLCV_COLUMNS
 
 def test_local_csv_research_data_source_lists_a_share_instruments(tmp_path) -> None:
     (tmp_path / "600519.SH-1d.csv").write_text(
-        "date,open,high,low,close,volume\n"
-        "2026-07-06,1700,1710,1690,1705,100000\n",
+        "date,open,high,low,close,volume\n2026-07-06,1700,1710,1690,1705,100000\n",
         encoding="utf-8",
     )
 
@@ -22,8 +21,7 @@ def test_local_csv_research_data_source_lists_a_share_instruments(tmp_path) -> N
 
 def test_local_csv_research_data_source_lists_instruments_with_hyphen_timeframes(tmp_path) -> None:
     (tmp_path / "600519.SH-1-day.csv").write_text(
-        "date,open,high,low,close,volume\n"
-        "2026-07-06,1700,1710,1690,1705,100000\n",
+        "date,open,high,low,close,volume\n2026-07-06,1700,1710,1690,1705,100000\n",
         encoding="utf-8",
     )
 
@@ -57,8 +55,7 @@ def test_local_csv_research_data_source_rejects_instrument_path_traversal(tmp_pa
     data_root = tmp_path / "research_data" / "a_share"
     data_root.mkdir(parents=True)
     (tmp_path / "secret-1d.csv").write_text(
-        "date,open,high,low,close,volume\n"
-        "2026-07-08,424242,424242,424242,424242,424242\n",
+        "date,open,high,low,close,volume\n2026-07-08,424242,424242,424242,424242,424242\n",
         encoding="utf-8",
     )
     data_source = LocalCsvResearchDataSource(data_root)
@@ -73,8 +70,7 @@ def test_local_csv_research_data_source_rejects_timeframe_path_traversal(
     timeframe,
 ) -> None:
     (tmp_path / "600519.SH-1d.csv").write_text(
-        "date,open,high,low,close,volume\n"
-        "2026-07-06,1700,1710,1690,1705,100000\n",
+        "date,open,high,low,close,volume\n2026-07-06,1700,1710,1690,1705,100000\n",
         encoding="utf-8",
     )
     data_source = LocalCsvResearchDataSource(tmp_path)

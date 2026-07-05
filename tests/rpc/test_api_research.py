@@ -36,8 +36,7 @@ def research_client(default_conf, tmp_path, mocker):
         encoding="utf-8",
     )
     (tmp_path / "secret-1d.csv").write_text(
-        "date,open,high,low,close,volume\n"
-        "2026-07-08,424242,424242,424242,424242,424242\n",
+        "date,open,high,low,close,volume\n2026-07-08,424242,424242,424242,424242,424242\n",
         encoding="utf-8",
     )
     default_conf["runmode"] = RunMode.OTHER
@@ -187,6 +186,32 @@ def test_research_chart_candles_rejects_path_traversal_without_leaking_secret(
     assert "data_root" not in response_text
     assert "\\" not in response_text
     assert re.search(r"[A-Za-z]:", response_text) is None
+
+
+@pytest.mark.parametrize("timeframe", ["../1d", r"..\1d"])
+def test_research_chart_candles_rejects_timeframe_traversal_without_leaking_secret(
+    research_client,
+    tmp_path,
+    timeframe,
+) -> None:
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/chart_candles",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "600519.SH",
+            "timeframe": timeframe,
+        },
+    )
+
+    response_text = response.text
+    assert response.status_code == 400
+    assert "424242" not in response_text
+    assert str(tmp_path) not in response_text
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", response_text) is None
 
 
 def test_research_chart_candles_unexpected_error_does_not_leak_detail(
