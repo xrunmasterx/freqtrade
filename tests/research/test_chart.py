@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from freqtrade.research import load_research_profiles
 from freqtrade.research.chart import build_research_chart_candles_response
 from freqtrade.rpc.api_server.api_schemas import ResearchChartCandlesRequest
@@ -40,6 +42,18 @@ def test_build_research_chart_candles_response_uses_local_csv_profile(tmp_path) 
     assert response["timeframe"] == "1d"
     assert response["chart_timeframe"] == "1d"
     assert response["columns"][:6] == ["date", "open", "high", "low", "close", "volume"]
+    assert "__date_ts" in response["columns"]
+    assert response["timeframe_ms"] == 86400000
     assert response["length"] == 2
     assert response["meta"]["layers"][0]["source"] == "market"
     assert response["plot_config"]
+
+
+def test_research_chart_module_does_not_import_trading_chain() -> None:
+    source = Path("freqtrade/research/chart.py").read_text(encoding="utf-8")
+
+    assert "from freqtrade.rpc import RPC" not in source
+    assert "freqtrade.rpc.rpc" not in source
+    assert "Exchange" not in source
+    assert "Trade" not in source
+    assert "Wallet" not in source

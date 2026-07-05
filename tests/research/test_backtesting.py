@@ -109,3 +109,8 @@ def test_research_backtest_rejects_non_finite_prices(column: str, value: float) 
 def test_research_backtest_rejects_invalid_period_order() -> None:
     with pytest.raises((ValueError, ValidationError)):
         ResearchBacktestConfig(initial_cash=10000, fast=2, slow=2)
+
+
+def test_research_backtest_config_rejects_infinite_initial_cash() -> None:
+    with pytest.raises(ValidationError):
+        ResearchBacktestConfig(initial_cash=float("inf"), fast=1, slow=2)

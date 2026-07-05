@@ -9,7 +9,7 @@ from freqtrade.research.strategies import add_sma_cross_signals
 
 
 class ResearchBacktestConfig(BaseModel):
-    initial_cash: float = Field(gt=0)
+    initial_cash: float = Field(gt=0, allow_inf_nan=False)
     fast: int = Field(default=20, ge=1)
     slow: int = Field(default=60, ge=2)
     lot_size: int = Field(default=100, ge=1)

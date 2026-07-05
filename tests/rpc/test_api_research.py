@@ -101,6 +101,18 @@ def client_post(client: TestClient, url, data=None):
     )
 
 
+def client_post_raw_json(client: TestClient, url, content: str):
+    return client.post(
+        url,
+        content=content,
+        headers={
+            "Authorization": _basic_auth_str(_TEST_USER, _TEST_PASS),
+            "Origin": "http://example.com",
+            "content-type": "application/json",
+        },
+    )
+
+
 def test_research_bots_returns_public_profile_without_data_root(research_client) -> None:
     response = client_get(research_client, f"{BASE_URI}/research/bots")
 
@@ -363,6 +375,30 @@ def test_research_backtest_rejects_non_finite_price_without_leaking_path(
     assert "data_root" not in response_text
     assert "\\" not in response_text
     assert re.search(r"[A-Za-z]:", response_text) is None
+
+
+def test_research_backtest_rejects_infinite_initial_cash_without_null_metrics(
+    research_client,
+) -> None:
+    response = client_post_raw_json(
+        research_client,
+        f"{BASE_URI}/research/backtest",
+        content=(
+            '{"bot_id":"a-share-local","instrument":"600519.SH","timeframe":"1d",'
+            '"initial_cash":Infinity,'
+            '"strategy":{"type":"sma_cross","fast":1,"slow":2}}'
+        ),
+    )
+
+    response_text = response.text
+    assert response.status_code in {400, 422}
+    assert response.status_code != 200
+    assert '"metrics"' not in response_text
+    assert '"initial_cash":null' not in response_text
+    assert '"final_equity":null' not in response_text
+    assert '"return_ratio":null' not in response_text
+    assert '"total_return":null' not in response_text
+    assert '"cash":null' not in response_text
 
 
 def test_research_backtest_unexpected_error_does_not_leak_detail(

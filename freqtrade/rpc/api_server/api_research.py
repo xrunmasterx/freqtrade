@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.exceptions import HTTPException
@@ -74,26 +75,31 @@ def research_chart_candles(
 
 @router.post("/research/backtest")
 def research_backtest(
-    payload: ResearchBacktestRequest,
+    payload: dict[str, Any],
     config=Depends(get_config),
 ):
-    profile = _get_research_profile(config, payload.bot_id)
+    try:
+        request = ResearchBacktestRequest.model_validate(payload)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid research backtest request")
+
+    profile = _get_research_profile(config, request.bot_id)
     try:
         dataframe = _get_local_csv_data_source(profile).load_ohlcv(
-            payload.instrument,
-            payload.timeframe,
+            request.instrument,
+            request.timeframe,
         )
         backtest_config = ResearchBacktestConfig(
-            initial_cash=payload.initial_cash,
-            fast=payload.strategy.fast,
-            slow=payload.strategy.slow,
+            initial_cash=request.initial_cash,
+            fast=request.strategy.fast,
+            slow=request.strategy.slow,
         )
-        result = run_research_backtest(payload.instrument, dataframe, backtest_config)
+        result = run_research_backtest(request.instrument, dataframe, backtest_config)
         return result.model_dump(mode="json")
     except FileNotFoundError:
         raise HTTPException(
             status_code=404,
-            detail=f"Research OHLCV not found for {payload.instrument} {payload.timeframe}",
+            detail=f"Research OHLCV not found for {request.instrument} {request.timeframe}",
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid research backtest request")

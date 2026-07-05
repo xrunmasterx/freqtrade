@@ -687,7 +687,7 @@ class ResearchBacktestRequest(BaseModel):
     strategy: ResearchSmaCrossStrategyRequest = Field(
         default_factory=ResearchSmaCrossStrategyRequest
     )
-    initial_cash: float = Field(default=100000, gt=0)
+    initial_cash: float = Field(default=100000, gt=0, allow_inf_nan=False)
 
 
 class ResearchBotResponse(BaseModel):
