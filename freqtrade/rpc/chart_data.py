@@ -21,6 +21,7 @@ from freqtrade.rpc.api_server.api_schemas import (
     ChartSeriesMeta,
     ChartWindowMeta,
 )
+from freqtrade.rpc.chart_composition import ChartComposition, ChartFrame, ChartLayer
 from freqtrade.rpc.chart_indicators import add_watch_indicators, build_watch_plot_config
 from freqtrade.util.datetime_helpers import dt_now, dt_ts
 
@@ -203,6 +204,31 @@ def merge_plot_config(left: dict[str, Any], right: dict[str, Any]) -> dict[str, 
 def build_chart_candles_response(
     rpc: RPC, config: dict[str, Any], payload: ChartCandlesRequest
 ) -> dict[str, Any]:
+    composition = build_chart_composition(rpc, config, payload)
+    response = RPC._convert_dataframe_to_dict(
+        config.get("strategy", ""),
+        composition.frame.pair,
+        composition.frame.timeframe,
+        composition.frame.dataframe.copy(),
+        dt_now(),
+        None,
+        [],
+    )
+    response.update(
+        {
+            "chart_timeframe": composition.frame.timeframe,
+            "strategy_timeframe": composition.strategy_timeframe,
+            "overlay": composition.overlay.model_dump() if composition.overlay else None,
+            "candle_mode": composition.candle_mode,
+        }
+    )
+    response.update(composition.legacy_update())
+    return response
+
+
+def build_chart_composition(
+    rpc: RPC, config: dict[str, Any], payload: ChartCandlesRequest
+) -> ChartComposition:
     chart_dataframe = load_chart_ohlcv(
         rpc._freqtrade.exchange,
         config,
@@ -274,28 +300,25 @@ def build_chart_candles_response(
         warnings,
         last_candle_complete,
     )
-    response = RPC._convert_dataframe_to_dict(
-        config.get("strategy", ""),
-        payload.pair,
-        payload.timeframe,
-        chart_dataframe.copy(),
-        dt_now(),
-        None,
-        [],
+    frame = ChartFrame(
+        dataframe=chart_dataframe,
+        pair=payload.pair,
+        timeframe=payload.timeframe,
+        requested_count=payload.limit,
+        warmup_count=CHART_WARMUP_CANDLES,
+        last_candle_complete=last_candle_complete,
     )
-    response.update(
-        {
-            "chart_timeframe": payload.timeframe,
-            "strategy_timeframe": strategy_timeframe,
-            "overlay": overlay.model_dump() if overlay else None,
-            "plot_config": plot_config,
-            "warnings": warnings,
-            "candle_mode": payload.candle_mode,
-            "last_candle_complete": last_candle_complete,
-            "meta": meta.model_dump(),
-        }
+    composition = ChartComposition(
+        frame=frame,
+        layers=_build_composition_layers(chart_dataframe, plot_config, meta),
+        strategy_timeframe=strategy_timeframe,
+        overlay=overlay,
+        candle_mode=payload.candle_mode,
+        plot_config=plot_config,
+        warnings=warnings,
+        meta=meta,
     )
-    return response
+    return composition
 
 
 def _build_chart_response_meta(
@@ -338,6 +361,47 @@ def _build_chart_response_meta(
         layers=layers,
         warnings=list(dict.fromkeys(meta_warnings)),
     )
+
+
+def _build_composition_layers(
+    dataframe: DataFrame, plot_config: dict[str, Any], meta: ChartResponseMeta
+) -> list[ChartLayer]:
+    return [
+        ChartLayer(
+            id=layer_meta.id,
+            source=layer_meta.source,
+            label=layer_meta.label,
+            dataframe=_layer_dataframe(dataframe, layer_meta),
+            plot_config=_layer_plot_config(plot_config, layer_meta),
+            meta=layer_meta,
+        )
+        for layer_meta in meta.layers
+    ]
+
+
+def _layer_dataframe(dataframe: DataFrame, layer_meta: ChartLayerMeta) -> DataFrame:
+    columns = ["date", *(series.column for series in layer_meta.series)]
+    available_columns = [column for column in columns if column in dataframe.columns]
+    return dataframe.loc[:, available_columns].copy()
+
+
+def _layer_plot_config(
+    plot_config: dict[str, Any], layer_meta: ChartLayerMeta
+) -> dict[str, Any]:
+    layer_columns = {series.column for series in layer_meta.series}
+    if not layer_columns:
+        return {}
+
+    result: dict[str, Any] = {"main_plot": {}, "subplots": {}}
+    for panel, column, config in _iter_plot_columns(plot_config):
+        if column not in layer_columns:
+            continue
+        if panel == "main":
+            result["main_plot"][column] = deepcopy(config)
+        else:
+            result["subplots"].setdefault(panel, {})
+            result["subplots"][panel][column] = deepcopy(config)
+    return result
 
 
 def _build_market_layer_meta(dataframe: DataFrame, timeframe: str) -> ChartLayerMeta:

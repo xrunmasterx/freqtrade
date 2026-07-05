@@ -10,6 +10,7 @@ from freqtrade.rpc.api_server.api_schemas import ChartCandlesRequest
 from freqtrade.rpc.chart_data import (
     CHART_WARMUP_CANDLES,
     build_chart_candles_response,
+    build_chart_composition,
     clear_chart_ohlcv_cache,
     load_chart_ohlcv,
     merge_strategy_overlay,
@@ -269,6 +270,105 @@ def test_build_chart_candles_response_includes_chart_meta(mocker):
     assert any(layer["source"] == "watch" for layer in response["meta"]["layers"])
 
 
+def test_build_chart_candles_response_keeps_legacy_fields_with_meta_layers(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert response["chart_timeframe"] == "15m"
+    assert response["strategy_timeframe"] is None
+    assert response["overlay"] is None
+    assert response["plot_config"]["main_plot"]["watch_ma20"] == {"color": "#3b82f6"}
+    assert response["warnings"] == []
+    assert response["candle_mode"] == "closed"
+    assert response["last_candle_complete"] is True
+    assert response["meta"]["window"]["last_candle_complete"] is True
+    assert response["meta"]["layers"]
+    assert response["length"] == 50
+    assert len(response["columns"]) == len(response["data"][0])
+
+
+def test_build_chart_composition_returns_frame_layers_and_legacy_meta(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+
+    composition = build_chart_composition(rpc, rpc._freqtrade.config, request)
+
+    assert len(composition.frame.dataframe) == 50
+    assert composition.frame.pair == "BTC/USDT"
+    assert composition.frame.timeframe == "15m"
+    assert composition.frame.requested_count == 50
+    assert [layer.source for layer in composition.layers] == ["market", "watch"]
+    assert composition.legacy_update()["meta"]["schema_version"] == 1
+    assert composition.strategy_timeframe is None
+    assert composition.overlay is None
+    assert composition.candle_mode == "closed"
+
+
+def test_build_chart_composition_includes_strategy_overlay_state(mocker):
+    chart_df = generate_test_data("15m", 8, "2024-01-01 10:00:00+00:00")
+    strategy_df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2024-01-01 10:00:00+00:00", "2024-01-01 11:00:00+00:00"],
+                utc=True,
+            ),
+            "atr": [120.0, 135.0],
+            "enter_long": [1, 0],
+        }
+    )
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    rpc._freqtrade.strategy.plot_config = {"main_plot": {"atr": {"color": "blue"}}, "subplots": {}}
+    rpc._freqtrade.dataprovider.get_analyzed_dataframe.return_value = (
+        strategy_df,
+        pd.Timestamp("2024-01-01 12:00:00+00:00").to_pydatetime(),
+    )
+    request = ChartCandlesRequest(pair="BTC/USDT", timeframe="15m", limit=8)
+
+    composition = build_chart_composition(rpc, rpc._freqtrade.config, request)
+
+    strategy_layer = next(layer for layer in composition.layers if layer.source == "strategy")
+    legacy_update = composition.legacy_update()
+
+    assert composition.strategy_timeframe == "1h"
+    assert composition.overlay.alignment == "forward_fill"
+    assert composition.overlay.hidden is False
+    assert "strategy_1h_atr" in composition.frame.dataframe.columns
+    assert strategy_layer.dataframe.columns.tolist() == ["date", "strategy_1h_atr"]
+    assert "strategy_1h_atr" in strategy_layer.plot_config["main_plot"]
+    assert "strategy_1h_atr" in composition.plot_config["main_plot"]
+    assert any(layer.source == "strategy" for layer in composition.meta.layers)
+    assert legacy_update["plot_config"] == composition.plot_config
+    assert legacy_update["warnings"] == []
+    assert legacy_update["meta"] == composition.meta.model_dump()
+    assert legacy_update["last_candle_complete"] == composition.frame.last_candle_complete
+
+
 def test_build_chart_candles_response_reports_live_incomplete_candle(mocker):
     clear_chart_ohlcv_cache()
     chart_df = generate_test_data("1m", 150, "2024-01-01 00:00:00+00:00")
@@ -499,6 +599,9 @@ def test_chart_meta_marks_hidden_strategy_overlay(mocker):
 
     strategy_layer = _meta_layer(response, "strategy")
     assert strategy_layer["status"] == "hidden"
+    assert response["warnings"] == [
+        "Strategy overlay hidden: chart timeframe is higher than strategy timeframe."
+    ]
     assert strategy_layer["warnings"] == [
         "Strategy overlay hidden: chart timeframe is higher than strategy timeframe."
     ]
