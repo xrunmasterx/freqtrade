@@ -12,8 +12,23 @@ def test_local_csv_research_data_source_lists_a_share_instruments(tmp_path) -> N
     )
 
     data_source = LocalCsvResearchDataSource(tmp_path)
+    instruments = data_source.list_instruments()
 
-    assert data_source.list_instruments() == ["600519.SH"]
+    assert [instrument.key for instrument in instruments] == ["600519.SH"]
+    assert instruments[0].venue == "SSE"
+    assert instruments[0].currency == "CNY"
+
+
+def test_local_csv_research_data_source_lists_instruments_with_hyphen_timeframes(tmp_path) -> None:
+    (tmp_path / "600519.SH-1-day.csv").write_text(
+        "date,open,high,low,close,volume\n"
+        "2026-07-06,1700,1710,1690,1705,100000\n",
+        encoding="utf-8",
+    )
+
+    data_source = LocalCsvResearchDataSource(tmp_path)
+
+    assert [instrument.key for instrument in data_source.list_instruments()] == ["600519.SH"]
 
 
 def test_local_csv_research_data_source_loads_normalized_ohlcv(tmp_path) -> None:

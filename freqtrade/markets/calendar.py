@@ -14,6 +14,9 @@ class AShareCalendar:
         self.closed_dates = closed_dates or set()
 
     def is_session_open(self, dt: datetime) -> bool:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_ASIA_SHANGHAI)
+
         local_dt = dt.astimezone(_ASIA_SHANGHAI)
 
         if local_dt.weekday() >= 5 or local_dt.date().isoformat() in self.closed_dates:
