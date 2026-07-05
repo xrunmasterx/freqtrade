@@ -252,6 +252,120 @@ def test_research_chart_candles_unexpected_error_does_not_leak_detail(
     assert re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", logs_text) is None
 
 
+def test_research_backtest_returns_simple_research_result(research_client) -> None:
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/backtest",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "600519.SH",
+            "timeframe": "1d",
+            "initial_cash": 100000,
+            "strategy": {
+                "type": "sma_cross",
+                "fast": 1,
+                "slow": 2,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["metrics"]["initial_cash"] == 100000
+    assert "return_ratio" in body["metrics"]
+    assert body["equity_curve"]
+    assert "live_trade" not in body["capability"]
+
+
+def test_research_backtest_unknown_bot_returns_404(research_client) -> None:
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/backtest",
+        data={
+            "bot_id": "unknown",
+            "instrument": "600519.SH",
+            "timeframe": "1d",
+        },
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload_update",
+    [
+        {"instrument": "../../secret"},
+        {"timeframe": "../1d"},
+    ],
+)
+def test_research_backtest_rejects_path_traversal_without_leaking_secret(
+    research_client,
+    tmp_path,
+    payload_update,
+) -> None:
+    payload = {
+        "bot_id": "a-share-local",
+        "instrument": "600519.SH",
+        "timeframe": "1d",
+    }
+    payload.update(payload_update)
+
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/backtest",
+        data=payload,
+    )
+
+    response_text = response.text
+    assert response.status_code == 400
+    assert "secret" not in response_text
+    assert "424242" not in response_text
+    assert str(tmp_path) not in response_text
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"[A-Za-z]:", response_text) is None
+
+
+def test_research_backtest_unexpected_error_does_not_leak_detail(
+    research_client,
+    mocker,
+) -> None:
+    private_path = rf"G:\private\research_data\data_root\{_PRIVATE_PATH_TOKEN}\600519.SH-1d.csv"
+    mocker.patch(
+        "freqtrade.rpc.api_server.api_research.run_research_backtest",
+        side_effect=RuntimeError(private_path),
+    )
+
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/backtest",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "600519.SH",
+            "timeframe": "1d",
+        },
+    )
+
+    response_text = response.text
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Research backtest unavailable"
+    assert _PRIVATE_PATH_TOKEN not in response_text
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"[A-Za-z]:", response_text) is None
+
+    logs_response = client_get(research_client, f"{BASE_URI}/logs?limit=20")
+    assert logs_response.status_code == 200
+    logs_text = "\n".join(record[4] for record in logs_response.json()["logs"])
+    assert _PRIVATE_PATH_TOKEN not in logs_text
+    assert "research_data" not in logs_text
+    assert "data_root" not in logs_text
+    assert "\\" not in logs_text
+    assert re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", logs_text) is None
+
+
 def test_research_unknown_bot_returns_404(research_client) -> None:
     response = client_get(
         research_client,

@@ -8,9 +8,11 @@ from freqtrade.research import (
     ResearchBotProfile,
     load_research_profiles,
 )
+from freqtrade.research.backtesting import ResearchBacktestConfig, run_research_backtest
 from freqtrade.research.chart import build_research_chart_candles_response
 from freqtrade.rpc.api_server.api_schemas import (
     ChartCandlesResponse,
+    ResearchBacktestRequest,
     ResearchBotsResponse,
     ResearchChartCandlesRequest,
     ResearchInstrumentsResponse,
@@ -68,6 +70,36 @@ def research_chart_candles(
     except Exception:
         logger.error("Research chart data unavailable")
         raise HTTPException(status_code=502, detail="Research chart data unavailable")
+
+
+@router.post("/research/backtest")
+def research_backtest(
+    payload: ResearchBacktestRequest,
+    config=Depends(get_config),
+):
+    profile = _get_research_profile(config, payload.bot_id)
+    try:
+        dataframe = _get_local_csv_data_source(profile).load_ohlcv(
+            payload.instrument,
+            payload.timeframe,
+        )
+        backtest_config = ResearchBacktestConfig(
+            initial_cash=payload.initial_cash,
+            fast=payload.strategy.fast,
+            slow=payload.strategy.slow,
+        )
+        result = run_research_backtest(payload.instrument, dataframe, backtest_config)
+        return result.model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Research OHLCV not found for {payload.instrument} {payload.timeframe}",
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid research backtest request")
+    except Exception:
+        logger.error("Research backtest unavailable")
+        raise HTTPException(status_code=502, detail="Research backtest unavailable")
 
 
 def _get_research_profile(config: dict, bot_id: str) -> ResearchBotProfile:

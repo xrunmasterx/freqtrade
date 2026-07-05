@@ -667,6 +667,29 @@ class ResearchChartCandlesRequest(BaseModel):
     watch_indicators: ChartIndicatorRequest | None = None
 
 
+class ResearchSmaCrossStrategyRequest(BaseModel):
+    type: Literal["sma_cross"] = "sma_cross"
+    fast: int = Field(default=20, ge=1)
+    slow: int = Field(default=60, ge=2)
+
+    @model_validator(mode="after")
+    def validate_period_order(self):
+        if self.fast >= self.slow:
+            raise ValueError("SMA fast period must be less than slow period.")
+        return self
+
+
+class ResearchBacktestRequest(BaseModel):
+    bot_id: str
+    instrument: str
+    timeframe: str
+    timerange: str | None = None
+    strategy: ResearchSmaCrossStrategyRequest = Field(
+        default_factory=ResearchSmaCrossStrategyRequest
+    )
+    initial_cash: float = Field(default=100000, gt=0)
+
+
 class ResearchBotResponse(BaseModel):
     id: str
     label: str
