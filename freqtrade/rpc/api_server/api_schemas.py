@@ -650,6 +650,7 @@ class ChartCandlesRequest(BaseModel):
     pair: str
     timeframe: str
     limit: int = Field(default=500, ge=1, le=2000)
+    display_count: int | None = Field(default=None, ge=1, le=2000)
     watch_indicators: ChartIndicatorRequest | None = None
     include_strategy_overlay: bool = True
     candle_mode: Literal["closed", "live"] = "closed"

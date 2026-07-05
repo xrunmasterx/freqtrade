@@ -354,6 +354,7 @@ def _build_chart_response_meta(
             requested_count=payload.limit,
             returned_count=len(dataframe),
             warmup_count=CHART_WARMUP_CANDLES,
+            display_default_count=payload.display_count,
             data_start=_date_string(dataframe.iloc[0]["date"]) if not dataframe.empty else None,
             data_stop=_date_string(dataframe.iloc[-1]["date"]) if not dataframe.empty else None,
             last_candle_complete=last_candle_complete,

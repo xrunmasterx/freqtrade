@@ -256,8 +256,8 @@ def test_build_chart_candles_response_includes_chart_meta(mocker):
     response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
 
     assert response["meta"]["schema_version"] == 1
-    assert response["meta"]["window"]["requested_count"] == 50
-    assert response["meta"]["window"]["returned_count"] == 50
+    assert response["meta"]["window"]["requested_count"] == request.limit
+    assert response["meta"]["window"]["returned_count"] == len(response["data"])
     assert response["meta"]["window"]["warmup_count"] == CHART_WARMUP_CANDLES
     assert response["meta"]["window"]["data_start"] is not None
     assert response["meta"]["window"]["data_stop"] is not None
@@ -268,6 +268,41 @@ def test_build_chart_candles_response_includes_chart_meta(mocker):
         series["column"] for series in market_layer["series"]
     }
     assert any(layer["source"] == "watch" for layer in response["meta"]["layers"])
+
+
+@pytest.mark.parametrize("display_count", [20, 250])
+def test_build_chart_candles_response_includes_display_count_hint(mocker, display_count):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    baseline_request = ChartCandlesRequest(
+        pair="BTC/USDT",
+        timeframe="15m",
+        limit=50,
+        include_strategy_overlay=False,
+    )
+    request = ChartCandlesRequest(
+        pair="BTC/USDT",
+        timeframe="15m",
+        limit=50,
+        display_count=display_count,
+        include_strategy_overlay=False,
+    )
+
+    baseline_response = build_chart_candles_response(rpc, rpc._freqtrade.config, baseline_request)
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert response["meta"]["window"]["requested_count"] == request.limit
+    assert response["meta"]["window"]["returned_count"] == len(response["data"])
+    assert response["meta"]["window"]["warmup_count"] == CHART_WARMUP_CANDLES
+    assert response["meta"]["window"]["display_default_count"] == display_count
+    assert len(response["data"]) == len(baseline_response["data"]) == request.limit
+    assert response["data"] == baseline_response["data"]
 
 
 def test_build_chart_candles_response_keeps_legacy_fields_with_meta_layers(mocker):
