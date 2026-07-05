@@ -1,0 +1,37 @@
+import pandas as pd
+
+from freqtrade.research import LocalCsvResearchDataSource
+from freqtrade.research.data_source import RESEARCH_OHLCV_COLUMNS
+
+
+def test_local_csv_research_data_source_lists_a_share_instruments(tmp_path) -> None:
+    (tmp_path / "600519.SH-1d.csv").write_text(
+        "date,open,high,low,close,volume\n"
+        "2026-07-06,1700,1710,1690,1705,100000\n",
+        encoding="utf-8",
+    )
+
+    data_source = LocalCsvResearchDataSource(tmp_path)
+
+    assert data_source.list_instruments() == ["600519.SH"]
+
+
+def test_local_csv_research_data_source_loads_normalized_ohlcv(tmp_path) -> None:
+    (tmp_path / "600519.SH-1d.csv").write_text(
+        "date,open,high,low,close,volume,ignored\n"
+        "2026-07-07,1705,1715,1700,1710,200000,x\n"
+        "2026-07-06,1700,1710,1690,1705,100000,y\n",
+        encoding="utf-8",
+    )
+    data_source = LocalCsvResearchDataSource(tmp_path)
+
+    dataframe = data_source.load_ohlcv("600519.SH", "1d")
+
+    assert list(dataframe.columns) == RESEARCH_OHLCV_COLUMNS
+    assert pd.api.types.is_datetime64_any_dtype(dataframe["date"])
+    assert dataframe["date"].tolist() == [
+        pd.Timestamp("2026-07-06", tz="UTC"),
+        pd.Timestamp("2026-07-07", tz="UTC"),
+    ]
+    for column in ["open", "high", "low", "close", "volume"]:
+        assert pd.api.types.is_float_dtype(dataframe[column])
