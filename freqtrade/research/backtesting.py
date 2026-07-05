@@ -1,3 +1,4 @@
+import math
 from typing import Any
 
 import pandas as pd
@@ -40,61 +41,24 @@ def run_research_backtest(
     dataframe: DataFrame,
     config: ResearchBacktestConfig,
 ) -> ResearchBacktestResult:
+    _validate_backtest_prices(dataframe)
     dataframe = add_sma_cross_signals(dataframe, config.fast, config.slow)
     cash = float(config.initial_cash)
     shares = 0
     entry: dict[str, Any] | None = None
     trades: list[dict[str, Any]] = []
     equity_curve: list[dict[str, Any]] = []
-    signals: list[dict[str, Any]] = []
+    rows = list(dataframe.itertuples(index=False))
+    signals = _build_signal_records(rows)
 
-    for row in dataframe.itertuples(index=False):
+    for index, row in enumerate(rows):
         row_date = row.date
         open_price = float(row.open)
         close_price = float(row.close)
-        if open_price <= 0 or close_price <= 0:
-            raise ValueError("Invalid OHLCV price")
 
-        enter_long = int(row.enter_long)
-        exit_long = int(row.exit_long)
-
-        if enter_long:
-            signals.append(
-                {
-                    "date": _date_string(row_date),
-                    "type": "enter_long",
-                    "price": open_price,
-                }
-            )
-            if shares == 0:
-                shares_to_buy = _whole_lot_shares(
-                    cash,
-                    open_price,
-                    config.lot_size,
-                    config.commission_rate,
-                )
-                if shares_to_buy > 0:
-                    trade_value = shares_to_buy * open_price
-                    commission = trade_value * config.commission_rate
-                    cash -= trade_value + commission
-                    shares = shares_to_buy
-                    entry = {
-                        "date": row_date,
-                        "price": open_price,
-                        "shares": shares_to_buy,
-                        "value": trade_value,
-                        "commission": commission,
-                    }
-
-        if exit_long:
-            signals.append(
-                {
-                    "date": _date_string(row_date),
-                    "type": "exit_long",
-                    "price": open_price,
-                }
-            )
-            if shares > 0 and entry is not None and not _same_session(entry["date"], row_date):
+        if index > 0:
+            signal_row = rows[index - 1]
+            if int(signal_row.exit_long) and shares > 0 and entry is not None:
                 trade_value = shares * open_price
                 commission = trade_value * config.commission_rate
                 stamp_tax = trade_value * config.stamp_tax_rate
@@ -120,6 +84,26 @@ def run_research_backtest(
                 )
                 shares = 0
                 entry = None
+
+            if int(signal_row.enter_long) and shares == 0:
+                shares_to_buy = _whole_lot_shares(
+                    cash,
+                    open_price,
+                    config.lot_size,
+                    config.commission_rate,
+                )
+                if shares_to_buy > 0:
+                    trade_value = shares_to_buy * open_price
+                    commission = trade_value * config.commission_rate
+                    cash -= trade_value + commission
+                    shares = shares_to_buy
+                    entry = {
+                        "date": row_date,
+                        "price": open_price,
+                        "shares": shares_to_buy,
+                        "value": trade_value,
+                        "commission": commission,
+                    }
 
         equity_curve.append(
             {
@@ -150,6 +134,46 @@ def run_research_backtest(
     )
 
 
+def _validate_backtest_prices(dataframe: DataFrame) -> None:
+    for column in ("open", "close"):
+        prices = pd.to_numeric(dataframe[column], errors="raise")
+        for value in prices:
+            price = float(value)
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Invalid OHLCV price")
+
+
+def _build_signal_records(rows: list[Any]) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        execution_row = rows[index + 1] if index + 1 < len(rows) else None
+        if int(row.enter_long):
+            signals.append(_signal_record(row, execution_row, "enter_long"))
+        if int(row.exit_long):
+            signals.append(_signal_record(row, execution_row, "exit_long"))
+    return signals
+
+
+def _signal_record(
+    signal_row: Any,
+    execution_row: Any | None,
+    signal_type: str,
+) -> dict[str, Any]:
+    record = {
+        "date": _date_string(signal_row.date),
+        "type": signal_type,
+        "price": float(signal_row.close),
+    }
+    if execution_row is not None:
+        record.update(
+            {
+                "execution_date": _date_string(execution_row.date),
+                "execution_price": float(execution_row.open),
+            }
+        )
+    return record
+
+
 def _whole_lot_shares(
     cash: float,
     price: float,
@@ -158,10 +182,6 @@ def _whole_lot_shares(
 ) -> int:
     lot_cost = price * lot_size * (1 + commission_rate)
     return int(cash // lot_cost) * lot_size
-
-
-def _same_session(left: Any, right: Any) -> bool:
-    return pd.to_datetime(left, utc=True).date() == pd.to_datetime(right, utc=True).date()
 
 
 def _date_string(value: Any) -> str:

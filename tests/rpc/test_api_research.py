@@ -327,6 +327,44 @@ def test_research_backtest_rejects_path_traversal_without_leaking_secret(
     assert re.search(r"[A-Za-z]:", response_text) is None
 
 
+def test_research_backtest_rejects_non_finite_price_without_leaking_path(
+    research_client,
+    tmp_path,
+) -> None:
+    data_root = tmp_path / "research_data" / "a_share"
+    (data_root / "000001.SZ-1d.csv").write_text(
+        "date,open,high,low,close,volume\n"
+        "2026-07-06,10,10.5,9.5,10,1000\n"
+        "2026-07-07,9,9.5,8.5,9,1100\n"
+        "2026-07-08,inf,11.5,10.5,11,1200\n",
+        encoding="utf-8",
+    )
+
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/backtest",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "000001.SZ",
+            "timeframe": "1d",
+            "strategy": {
+                "type": "sma_cross",
+                "fast": 1,
+                "slow": 2,
+            },
+        },
+    )
+
+    response_text = response.text
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid research backtest request"
+    assert str(tmp_path) not in response_text
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"[A-Za-z]:", response_text) is None
+
+
 def test_research_backtest_unexpected_error_does_not_leak_detail(
     research_client,
     mocker,
