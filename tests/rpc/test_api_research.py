@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from requests.auth import _basic_auth_str
 
 from freqtrade.enums import RunMode
+from freqtrade.loggers import bufferHandler, setup_logging, setup_logging_pre
 from freqtrade.rpc.api_server import ApiServer
 
 
@@ -13,6 +14,15 @@ BASE_URI = "/api/v1"
 _TEST_USER = "FreqTrader"
 _TEST_PASS = "SuperSecurePassword1!"
 _JWT_SECRET_KEY = "99980ff8fcf77f21ef610adb46b788c505b8483897bc26203b5591eefe0d15"
+_PRIVATE_PATH_TOKEN = "PRIVATE_RESEARCH_PATH_TOKEN"
+
+
+def _clear_log_buffer() -> None:
+    bufferHandler.acquire()
+    try:
+        bufferHandler.buffer.clear()
+    finally:
+        bufferHandler.release()
 
 
 @pytest.fixture
@@ -23,6 +33,11 @@ def research_client(default_conf, tmp_path, mocker):
         "date,open,high,low,close,volume\n"
         "2026-07-06,1700,1710,1690,1705,100000\n"
         "2026-07-07,1705,1715,1700,1710,200000\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "secret-1d.csv").write_text(
+        "date,open,high,low,close,volume\n"
+        "2026-07-08,424242,424242,424242,424242,424242\n",
         encoding="utf-8",
     )
     default_conf["runmode"] = RunMode.OTHER
@@ -51,6 +66,9 @@ def research_client(default_conf, tmp_path, mocker):
             }
         }
     )
+    setup_logging_pre()
+    setup_logging(default_conf)
+    _clear_log_buffer()
     mocker.patch("freqtrade.rpc.api_server.ApiServer.start_api", MagicMock())
     apiserver = ApiServer(default_conf)
     try:
@@ -147,13 +165,38 @@ def test_research_chart_candles_missing_ohlcv_does_not_leak_local_path(
     assert re.search(r"[A-Za-z]:", response_text) is None
 
 
+def test_research_chart_candles_rejects_path_traversal_without_leaking_secret(
+    research_client,
+    tmp_path,
+) -> None:
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/chart_candles",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "../../secret",
+            "timeframe": "1d",
+        },
+    )
+
+    response_text = response.text
+    assert response.status_code == 400
+    assert "424242" not in response_text
+    assert str(tmp_path) not in response_text
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"[A-Za-z]:", response_text) is None
+
+
 def test_research_chart_candles_unexpected_error_does_not_leak_detail(
     research_client,
     mocker,
 ) -> None:
+    private_path = rf"G:\private\research_data\data_root\{_PRIVATE_PATH_TOKEN}\600519.SH-1d.csv"
     mocker.patch(
         "freqtrade.rpc.api_server.api_research.build_research_chart_candles_response",
-        side_effect=RuntimeError(r"G:\private\research_data\data_root\600519.SH-1d.csv"),
+        side_effect=RuntimeError(private_path),
     )
 
     response = client_post(
@@ -173,6 +216,15 @@ def test_research_chart_candles_unexpected_error_does_not_leak_detail(
     assert "data_root" not in response_text
     assert "\\" not in response_text
     assert re.search(r"[A-Za-z]:", response_text) is None
+
+    logs_response = client_get(research_client, f"{BASE_URI}/logs?limit=20")
+    assert logs_response.status_code == 200
+    logs_text = "\n".join(record[4] for record in logs_response.json()["logs"])
+    assert _PRIVATE_PATH_TOKEN not in logs_text
+    assert "research_data" not in logs_text
+    assert "data_root" not in logs_text
+    assert "\\" not in logs_text
+    assert re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", logs_text) is None
 
 
 def test_research_unknown_bot_returns_404(research_client) -> None:

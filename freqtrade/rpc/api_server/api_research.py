@@ -63,10 +63,10 @@ def research_chart_candles(
             status_code=404,
             detail=f"Research OHLCV not found for {payload.instrument} {payload.timeframe}",
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid research OHLCV request")
     except Exception:
-        logger.exception("Error in research_chart_candles")
+        logger.error("Research chart data unavailable")
         raise HTTPException(status_code=502, detail="Research chart data unavailable")
 
 
