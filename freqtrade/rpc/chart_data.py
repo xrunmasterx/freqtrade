@@ -12,7 +12,15 @@ from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS
 from freqtrade.enums import CandleType
 from freqtrade.exchange import date_minus_candles, timeframe_to_msecs
 from freqtrade.rpc import RPC
-from freqtrade.rpc.api_server.api_schemas import ChartCandlesRequest, ChartOverlayMeta
+from freqtrade.rpc.api_server.api_schemas import (
+    ChartCandlesRequest,
+    ChartLayerMeta,
+    ChartOverlayMeta,
+    ChartResponseMeta,
+    ChartSeriesCoverage,
+    ChartSeriesMeta,
+    ChartWindowMeta,
+)
 from freqtrade.rpc.chart_indicators import add_watch_indicators, build_watch_plot_config
 from freqtrade.util.datetime_helpers import dt_now, dt_ts
 
@@ -253,6 +261,19 @@ def build_chart_candles_response(
         chart_dataframe = _ensure_signal_columns(watch_dataframe)
 
     chart_dataframe = _trim_to_limit(chart_dataframe, payload.limit)
+    last_candle_complete = payload.candle_mode == "closed" or _last_candle_complete(
+        chart_dataframe, payload.timeframe
+    )
+    meta = _build_chart_response_meta(
+        chart_dataframe,
+        payload,
+        plot_config,
+        config.get("strategy", ""),
+        strategy_timeframe,
+        overlay,
+        warnings,
+        last_candle_complete,
+    )
     response = RPC._convert_dataframe_to_dict(
         config.get("strategy", ""),
         payload.pair,
@@ -270,11 +291,246 @@ def build_chart_candles_response(
             "plot_config": plot_config,
             "warnings": warnings,
             "candle_mode": payload.candle_mode,
-            "last_candle_complete": payload.candle_mode == "closed"
-            or _last_candle_complete(chart_dataframe, payload.timeframe),
+            "last_candle_complete": last_candle_complete,
+            "meta": meta.model_dump(),
         }
     )
     return response
+
+
+def _build_chart_response_meta(
+    dataframe: DataFrame,
+    payload: ChartCandlesRequest,
+    plot_config: dict[str, Any],
+    strategy_name: str,
+    strategy_timeframe: str | None,
+    overlay: ChartOverlayMeta | None,
+    warnings: list[str],
+    last_candle_complete: bool,
+) -> ChartResponseMeta:
+    layers = [
+        _build_market_layer_meta(dataframe, payload.timeframe),
+        _build_watch_layer_meta(dataframe, plot_config, payload.timeframe),
+    ]
+    strategy_layer = _build_strategy_layer_meta(
+        dataframe,
+        plot_config,
+        strategy_name,
+        strategy_timeframe,
+        overlay,
+    )
+    if strategy_layer:
+        layers.append(strategy_layer)
+
+    meta_warnings = list(warnings)
+    for layer in layers:
+        meta_warnings.extend(layer.warnings)
+
+    return ChartResponseMeta(
+        window=ChartWindowMeta(
+            requested_count=payload.limit,
+            returned_count=len(dataframe),
+            warmup_count=CHART_WARMUP_CANDLES,
+            data_start=_date_string(dataframe.iloc[0]["date"]) if not dataframe.empty else None,
+            data_stop=_date_string(dataframe.iloc[-1]["date"]) if not dataframe.empty else None,
+            last_candle_complete=last_candle_complete,
+        ),
+        layers=layers,
+        warnings=list(dict.fromkeys(meta_warnings)),
+    )
+
+
+def _build_market_layer_meta(dataframe: DataFrame, timeframe: str) -> ChartLayerMeta:
+    series = [
+        _series_meta(dataframe, "open", "Open", "market", "ohlcv", "main", timeframe),
+        _series_meta(dataframe, "high", "High", "market", "ohlcv", "main", timeframe),
+        _series_meta(dataframe, "low", "Low", "market", "ohlcv", "main", timeframe),
+        _series_meta(dataframe, "close", "Close", "market", "ohlcv", "main", timeframe),
+        _series_meta(dataframe, "volume", "Volume", "market", "bar", "volume", timeframe),
+    ]
+    return ChartLayerMeta(
+        id="market.ohlcv",
+        source="market",
+        status=_layer_status(series),
+        label="Market Data",
+        timeframe=timeframe,
+        alignment="direct",
+        series=series,
+    )
+
+
+def _build_watch_layer_meta(
+    dataframe: DataFrame, plot_config: dict[str, Any], timeframe: str
+) -> ChartLayerMeta:
+    series = []
+    for panel, column, config in _iter_plot_columns(plot_config):
+        if not column.startswith("watch_"):
+            continue
+        series.append(
+            _series_meta(
+                dataframe,
+                column,
+                _watch_series_label(column),
+                "watch",
+                str(config.get("type", "line")),
+                panel,
+                timeframe,
+                visible=config.get("hidden") is not True,
+            )
+        )
+
+    return ChartLayerMeta(
+        id="watch.indicators",
+        source="watch",
+        status=_layer_status(series),
+        label="Watch Indicators",
+        timeframe=timeframe,
+        alignment="direct",
+        series=series,
+    )
+
+
+def _build_strategy_layer_meta(
+    dataframe: DataFrame,
+    plot_config: dict[str, Any],
+    strategy_name: str,
+    strategy_timeframe: str | None,
+    overlay: ChartOverlayMeta | None,
+) -> ChartLayerMeta | None:
+    if not strategy_timeframe:
+        return None
+
+    if overlay and overlay.hidden:
+        return ChartLayerMeta(
+            id="strategy.overlay",
+            source="strategy",
+            status="hidden" if overlay.alignment == "hidden" else "unavailable",
+            label="Strategy Output",
+            timeframe=strategy_timeframe,
+            alignment=overlay.alignment,
+            warnings=[overlay.warning] if overlay.warning else [],
+        )
+
+    series = []
+    prefix = f"strategy_{strategy_timeframe}_"
+    for panel, column, config in _iter_plot_columns(plot_config):
+        if not column.startswith(prefix):
+            continue
+        original = column.removeprefix(prefix)
+        series.append(
+            _series_meta(
+                dataframe,
+                column,
+                f"{original} - Strategy Output - {strategy_name}",
+                "strategy",
+                str(config.get("type", "line")),
+                panel,
+                strategy_timeframe,
+            )
+        )
+
+    if not series:
+        return None
+
+    return ChartLayerMeta(
+        id="strategy.overlay",
+        source="strategy",
+        status=_layer_status(series),
+        label="Strategy Output",
+        timeframe=strategy_timeframe,
+        alignment=overlay.alignment if overlay else None,
+        series=series,
+    )
+
+
+def _series_meta(
+    dataframe: DataFrame,
+    column: str,
+    label: str,
+    source: str,
+    kind: str,
+    panel: str,
+    timeframe: str | None,
+    visible: bool = True,
+) -> ChartSeriesMeta:
+    return ChartSeriesMeta(
+        column=column,
+        label=label,
+        source=source,
+        kind=kind,
+        panel=panel,
+        timeframe=timeframe,
+        visible=visible,
+        coverage=_series_coverage(dataframe, column),
+    )
+
+
+def _series_coverage(dataframe: DataFrame, column: str) -> ChartSeriesCoverage:
+    total_points = len(dataframe)
+    if column not in dataframe.columns:
+        return ChartSeriesCoverage(total_points=total_points, reason="column unavailable")
+
+    valid_mask = dataframe[column].notna()
+    valid_points = int(valid_mask.sum())
+    if valid_points == 0:
+        return ChartSeriesCoverage(
+            total_points=total_points,
+            reason="no valid values in returned window",
+        )
+
+    valid_dates = dataframe.loc[valid_mask, "date"]
+    return ChartSeriesCoverage(
+        first_valid=_date_string(valid_dates.iloc[0]),
+        last_valid=_date_string(valid_dates.iloc[-1]),
+        valid_points=valid_points,
+        total_points=total_points,
+        reason="partial coverage" if valid_points < total_points else None,
+    )
+
+
+def _layer_status(series: list[ChartSeriesMeta]) -> str:
+    if any(item.coverage.valid_points < item.coverage.total_points for item in series):
+        return "partial"
+    return "ok"
+
+
+def _iter_plot_columns(plot_config: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    result: list[tuple[str, str, dict[str, Any]]] = []
+    main_plot = plot_config.get("main_plot", {}) if isinstance(plot_config, dict) else {}
+    if isinstance(main_plot, dict):
+        for column, config in main_plot.items():
+            result.append(("main", column, config if isinstance(config, dict) else {}))
+
+    subplots = plot_config.get("subplots", {}) if isinstance(plot_config, dict) else {}
+    if isinstance(subplots, dict):
+        for subplot_name, subplot_columns in subplots.items():
+            if not isinstance(subplot_columns, dict):
+                continue
+            for column, config in subplot_columns.items():
+                result.append(
+                    (str(subplot_name), column, config if isinstance(config, dict) else {})
+                )
+    return result
+
+
+def _date_string(value: Any) -> str:
+    return str(pd.to_datetime(value, utc=True))
+
+
+def _watch_series_label(column: str) -> str:
+    if column.startswith("watch_macd"):
+        return f"{column.removeprefix('watch_').upper()} - Watch"
+    if column.startswith("watch_ma"):
+        return f"MA({column.removeprefix('watch_ma')}) - Watch"
+    if column.startswith("watch_rsi"):
+        return f"RSI({column.removeprefix('watch_rsi')}) - Watch"
+    if column.startswith("watch_qqe_mod_"):
+        label = column.removeprefix("watch_qqe_mod_").replace("_", " ").title()
+        return f"QQE MOD {label} - Watch"
+    if column.startswith("watch_supertrend_"):
+        label = column.removeprefix("watch_supertrend_").replace("_", " ").title()
+        return f"Supertrend {label} - Watch"
+    return f"{column} - Watch"
 
 
 def _strategy_overlay_columns(

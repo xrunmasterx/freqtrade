@@ -663,6 +663,69 @@ class ChartOverlayMeta(BaseModel):
     warning: str | None = None
 
 
+class ChartWindowMeta(BaseModel):
+    requested_count: int
+    returned_count: int
+    warmup_count: int
+    display_default_count: int | None = None
+    data_start: str | None = None
+    data_stop: str | None = None
+    last_candle_complete: bool = True
+
+
+class ChartSeriesCoverage(BaseModel):
+    first_valid: str | None = None
+    last_valid: str | None = None
+    valid_points: int = 0
+    total_points: int = 0
+    warmup_until: str | None = None
+    reason: str | None = None
+
+
+class ChartSeriesMeta(BaseModel):
+    column: str
+    label: str
+    source: Literal[
+        "market",
+        "watch",
+        "strategy",
+        "execution",
+        "decision_snapshot",
+        "recomputed",
+    ]
+    kind: str
+    panel: str
+    timeframe: str | None = None
+    visible: bool = True
+    coverage: ChartSeriesCoverage
+    provisional: bool = False
+
+
+class ChartLayerMeta(BaseModel):
+    id: str
+    source: Literal[
+        "market",
+        "watch",
+        "strategy",
+        "execution",
+        "decision_snapshot",
+        "recomputed",
+    ]
+    status: Literal["ok", "partial", "hidden", "unavailable", "stale", "provisional"]
+    label: str
+    timeframe: str | None = None
+    alignment: str | None = None
+    series: list[ChartSeriesMeta] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ChartResponseMeta(BaseModel):
+    schema_version: int = 1
+    window: ChartWindowMeta
+    layers: list[ChartLayerMeta] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class PairHistoryRequest(PairCandlesRequest, ExchangeModePayloadMixin):
     timerange: str
     strategy: str | None = None
@@ -702,6 +765,7 @@ class ChartCandlesResponse(PairHistory):
     warnings: list[str] = Field(default_factory=list)
     candle_mode: Literal["closed", "live"] = "closed"
     last_candle_complete: bool = True
+    meta: ChartResponseMeta | None = None
 
 
 class BacktestFreqAIInputs(BaseModel):

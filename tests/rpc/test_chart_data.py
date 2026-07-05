@@ -8,6 +8,7 @@ from freqtrade.enums import CandleType
 from freqtrade.exchange import date_minus_candles
 from freqtrade.rpc.api_server.api_schemas import ChartCandlesRequest
 from freqtrade.rpc.chart_data import (
+    CHART_WARMUP_CANDLES,
     build_chart_candles_response,
     clear_chart_ohlcv_cache,
     load_chart_ohlcv,
@@ -19,6 +20,14 @@ from tests.conftest import generate_test_data
 def _response_column(response, column):
     column_index = response["columns"].index(column)
     return [row[column_index] for row in response["data"]]
+
+
+def _meta_layer(response, source):
+    return next(layer for layer in response["meta"]["layers"] if layer["source"] == source)
+
+
+def _meta_series_by_column(layer):
+    return {series["column"]: series for series in layer["series"]}
 
 
 def test_load_chart_ohlcv_uses_limit_and_warmup(mocker):
@@ -230,6 +239,36 @@ def test_build_chart_candles_response_returns_watch_data_when_overlay_fails(mock
     assert any("Strategy overlay unavailable" in warning for warning in response["warnings"])
 
 
+def test_build_chart_candles_response_includes_chart_meta(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert response["meta"]["schema_version"] == 1
+    assert response["meta"]["window"]["requested_count"] == 50
+    assert response["meta"]["window"]["returned_count"] == 50
+    assert response["meta"]["window"]["warmup_count"] == CHART_WARMUP_CANDLES
+    assert response["meta"]["window"]["data_start"] is not None
+    assert response["meta"]["window"]["data_stop"] is not None
+    market_layer = _meta_layer(response, "market")
+    assert market_layer["source"] == "market"
+    assert market_layer["id"] == "market.ohlcv"
+    assert {"open", "high", "low", "close", "volume"} <= {
+        series["column"] for series in market_layer["series"]
+    }
+    assert any(layer["source"] == "watch" for layer in response["meta"]["layers"])
+
+
 def test_build_chart_candles_response_reports_live_incomplete_candle(mocker):
     clear_chart_ohlcv_cache()
     chart_df = generate_test_data("1m", 150, "2024-01-01 00:00:00+00:00")
@@ -257,6 +296,33 @@ def test_build_chart_candles_response_reports_live_incomplete_candle(mocker):
     assert response["candle_mode"] == "live"
     assert response["last_candle_complete"] is False
     assert response["length"] == 50
+
+
+def test_build_chart_candles_response_live_meta_matches_top_level(mocker):
+    clear_chart_ohlcv_cache()
+    chart_df = generate_test_data("1m", 150, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.refresh_latest_ohlcv.return_value = {
+        ("BTC/USDT", "1m", CandleType.SPOT): chart_df
+    }
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    now = pd.Timestamp("2024-01-01 02:29:30+00:00").to_pydatetime()
+    mocker.patch("freqtrade.rpc.chart_data.dt_now", return_value=now)
+    request = ChartCandlesRequest(
+        pair="BTC/USDT",
+        timeframe="1m",
+        limit=50,
+        include_strategy_overlay=False,
+        candle_mode="live",
+    )
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert response["meta"]["window"]["last_candle_complete"] == response["last_candle_complete"]
 
 
 def test_build_chart_candles_response_returns_watch_only_when_overlay_plot_config_fails(
@@ -299,6 +365,9 @@ def test_build_chart_candles_response_returns_watch_only_when_overlay_plot_confi
     assert response["overlay"]["hidden"] is True
     assert response["overlay"]["alignment"] == "unavailable"
     assert response["overlay"]["columns"] == []
+    strategy_layer = _meta_layer(response, "strategy")
+    assert strategy_layer["status"] == "unavailable"
+    assert strategy_layer["warnings"] == ["Strategy overlay unavailable for BTC/USDT 1h"]
     assert "Strategy overlay unavailable for BTC/USDT 1h" in caplog.text
 
 
@@ -335,6 +404,130 @@ def test_build_chart_candles_response_includes_strategy_overlay(mocker):
     assert "strategy_1h_atr" in response["columns"]
     assert "strategy_1h_atr" in response["plot_config"]["main_plot"]
     assert response["warnings"] == []
+
+
+def test_chart_meta_separates_watch_and_strategy_sources(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    strategy_df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2024-01-02 12:00:00+00:00", "2024-01-02 13:00:00+00:00"],
+                utc=True,
+            ),
+            "atr": [120.0, 135.0],
+        }
+    )
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    rpc._freqtrade.strategy.plot_config = {"main_plot": {"atr": {"color": "blue"}}, "subplots": {}}
+    rpc._freqtrade.dataprovider.get_analyzed_dataframe.return_value = (
+        strategy_df,
+        pd.Timestamp("2024-01-02 14:00:00+00:00").to_pydatetime(),
+    )
+    request = ChartCandlesRequest(pair="BTC/USDT", timeframe="15m", limit=50)
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    watch_layer = _meta_layer(response, "watch")
+    strategy_layer = _meta_layer(response, "strategy")
+    assert watch_layer["label"] == "Watch Indicators"
+    assert strategy_layer["label"] == "Strategy Output"
+    assert all(series["source"] == "watch" for series in watch_layer["series"])
+    assert all(series["source"] == "strategy" for series in strategy_layer["series"])
+
+
+def test_chart_meta_marks_partial_strategy_coverage(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    strategy_df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2024-01-02 12:00:00+00:00", "2024-01-02 13:00:00+00:00"],
+                utc=True,
+            ),
+            "atr": [120.0, 135.0],
+        }
+    )
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    rpc._freqtrade.strategy.plot_config = {"main_plot": {"atr": {"color": "blue"}}, "subplots": {}}
+    rpc._freqtrade.dataprovider.get_analyzed_dataframe.return_value = (
+        strategy_df,
+        pd.Timestamp("2024-01-02 14:00:00+00:00").to_pydatetime(),
+    )
+    request = ChartCandlesRequest(pair="BTC/USDT", timeframe="15m", limit=50)
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    strategy_layer = _meta_layer(response, "strategy")
+    assert strategy_layer["status"] == "partial"
+    assert any(
+        series["coverage"]["reason"] == "partial coverage"
+        and series["coverage"]["valid_points"] < series["coverage"]["total_points"]
+        for series in strategy_layer["series"]
+    )
+
+
+def test_chart_meta_marks_hidden_strategy_overlay(mocker):
+    chart_df = generate_test_data("4h", 50, "2024-01-01 00:00:00+00:00")
+    strategy_df = generate_test_data("1h", 200, "2024-01-01 00:00:00+00:00")
+    strategy_df["atr"] = range(200)
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    rpc._freqtrade.strategy.plot_config = {"main_plot": {"atr": {"color": "blue"}}, "subplots": {}}
+    rpc._freqtrade.dataprovider.get_analyzed_dataframe.return_value = (
+        strategy_df,
+        pd.Timestamp("2024-01-09 08:00:00+00:00").to_pydatetime(),
+    )
+    request = ChartCandlesRequest(pair="BTC/USDT", timeframe="4h", limit=50)
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    strategy_layer = _meta_layer(response, "strategy")
+    assert strategy_layer["status"] == "hidden"
+    assert strategy_layer["warnings"] == [
+        "Strategy overlay hidden: chart timeframe is higher than strategy timeframe."
+    ]
+    assert response["meta"]["warnings"] == [
+        "Strategy overlay hidden: chart timeframe is higher than strategy timeframe."
+    ]
+
+
+def test_chart_meta_omits_empty_ok_strategy_layer_when_overlay_has_no_plot_columns(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    strategy_df = chart_df[["date"]].copy()
+    strategy_df["unplotted"] = range(len(strategy_df))
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "15m",
+        "candle_type_def": CandleType.SPOT,
+    }
+    rpc._freqtrade.strategy.plot_config = {"main_plot": {}, "subplots": {}}
+    rpc._freqtrade.dataprovider.get_analyzed_dataframe.return_value = (
+        strategy_df,
+        pd.Timestamp("2024-01-02 18:30:00+00:00").to_pydatetime(),
+    )
+    request = ChartCandlesRequest(pair="BTC/USDT", timeframe="15m", limit=50)
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert not any(layer["source"] == "strategy" for layer in response["meta"]["layers"])
 
 
 def test_build_chart_candles_response_propagates_ohlcv_failures(mocker):
@@ -397,6 +590,30 @@ def test_build_chart_candles_response_includes_watch_plot_config(mocker):
     assert "QQE MOD" in response["plot_config"]["subplots"]
     assert "watch_qqe_mod_hist" in response["plot_config"]["subplots"]["QQE MOD"]
     assert "watch_qqe_mod_trend" in response["plot_config"]["subplots"]["QQE MOD"]
+
+
+def test_chart_meta_labels_macd_watch_columns_as_macd(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    watch_series = _meta_series_by_column(_meta_layer(response, "watch"))
+    assert watch_series["watch_macd"]["label"] == "MACD - Watch"
+    assert watch_series["watch_macdsignal"]["label"] == "MACDSIGNAL - Watch"
+    assert watch_series["watch_macdhist"]["label"] == "MACDHIST - Watch"
+    assert watch_series["watch_macd"]["label"] != "MA(cd) - Watch"
+    assert watch_series["watch_macdsignal"]["label"] != "MA(cdsignal) - Watch"
+    assert watch_series["watch_macdhist"]["label"] != "MA(cdhist) - Watch"
 
 
 def test_build_chart_candles_response_includes_qqe_mod_watch_indicator(mocker):
