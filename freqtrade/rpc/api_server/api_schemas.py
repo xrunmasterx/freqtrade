@@ -6,6 +6,7 @@ from pydantic import AwareDatetime, BaseModel, Field, RootModel, SerializeAsAny,
 from freqtrade.constants import DL_DATA_TIMEFRAMES, IntOrInf
 from freqtrade.enums import MarginMode, OrderTypeValues, SignalDirection, TradingMode
 from freqtrade.ft_types import AnnotationType, ValidExchangesType
+from freqtrade.markets import BotCapabilities, Instrument, MarketType
 from freqtrade.rpc.api_server.webserver_bgwork import JOB_CATEGORIES, ProgressTask
 
 
@@ -654,6 +655,31 @@ class ChartCandlesRequest(BaseModel):
     watch_indicators: ChartIndicatorRequest | None = None
     include_strategy_overlay: bool = True
     candle_mode: Literal["closed", "live"] = "closed"
+
+
+class ResearchChartCandlesRequest(BaseModel):
+    bot_id: str
+    instrument: str
+    timeframe: str
+    limit: int = Field(default=500, ge=1, le=2000)
+    timerange: str | None = None
+    adjustment: Literal["raw", "qfq", "hfq"] = "raw"
+    watch_indicators: ChartIndicatorRequest | None = None
+
+
+class ResearchBotResponse(BaseModel):
+    id: str
+    label: str
+    market: MarketType
+    capabilities: BotCapabilities
+
+
+class ResearchBotsResponse(BaseModel):
+    bots: list[ResearchBotResponse]
+
+
+class ResearchInstrumentsResponse(BaseModel):
+    instruments: list[Instrument]
 
 
 class ChartOverlayMeta(BaseModel):
