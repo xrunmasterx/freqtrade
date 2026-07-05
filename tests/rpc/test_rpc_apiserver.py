@@ -2372,6 +2372,11 @@ def test_show_config_api_version_has_chart_candles(botclient):
             "timeframe": "15m",
             "watch_indicators": {"macd": [{"fast": 12, "slow": 12, "signal": 9}]},
         },
+        {
+            "pair": "XRP/BTC",
+            "timeframe": "5m",
+            "watch_indicators": {"qqe_mod": [{"rsi_length": 0}]},
+        },
     ],
 )
 def test_chart_candles_schema_validation(botclient, payload):

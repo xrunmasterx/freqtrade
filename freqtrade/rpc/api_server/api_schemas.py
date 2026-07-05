@@ -608,10 +608,34 @@ class MacdIndicatorRequest(BaseModel):
         return self
 
 
+class SupertrendIndicatorRequest(BaseModel):
+    period: int = Field(default=10, ge=1, le=500)
+    multiplier: float = Field(default=3.0, gt=0, le=100)
+
+
+class QqeModIndicatorRequest(BaseModel):
+    rsi_length: int = Field(default=6, ge=1, le=500)
+    rsi_smoothing: int = Field(default=5, ge=1, le=500)
+    qqe_factor: float = Field(default=3.0, gt=0, le=100)
+    bollinger_length: int = Field(default=50, ge=1, le=1000)
+    bollinger_multiplier: float = Field(default=0.35, gt=0, le=100)
+    secondary_rsi_length: int = Field(default=6, ge=1, le=500)
+    secondary_rsi_smoothing: int = Field(default=5, ge=1, le=500)
+    secondary_qqe_factor: float = Field(default=1.61, gt=0, le=100)
+    threshold: float = Field(default=3.0, gt=0, le=100)
+    source: str = Field(default="close", min_length=1, max_length=64)
+
+
 class ChartIndicatorRequest(BaseModel):
     ma: list[int] = Field(default_factory=lambda: [20, 60])
     rsi: list[int] = Field(default_factory=lambda: [14])
     macd: list[MacdIndicatorRequest] = Field(default_factory=lambda: [MacdIndicatorRequest()])
+    supertrend: list[SupertrendIndicatorRequest] = Field(
+        default_factory=lambda: [SupertrendIndicatorRequest()]
+    )
+    qqe_mod: list[QqeModIndicatorRequest] = Field(
+        default_factory=lambda: [QqeModIndicatorRequest()]
+    )
 
     @model_validator(mode="after")
     def validate_indicator_periods(self):
@@ -628,6 +652,7 @@ class ChartCandlesRequest(BaseModel):
     limit: int = Field(default=500, ge=1, le=2000)
     watch_indicators: ChartIndicatorRequest | None = None
     include_strategy_overlay: bool = True
+    candle_mode: Literal["closed", "live"] = "closed"
 
 
 class ChartOverlayMeta(BaseModel):
@@ -675,6 +700,8 @@ class ChartCandlesResponse(PairHistory):
     overlay: ChartOverlayMeta | None = None
     plot_config: PlotConfig
     warnings: list[str] = Field(default_factory=list)
+    candle_mode: Literal["closed", "live"] = "closed"
+    last_candle_complete: bool = True
 
 
 class BacktestFreqAIInputs(BaseModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from copy import deepcopy
 from typing import Any
 
@@ -19,28 +20,85 @@ from freqtrade.util.datetime_helpers import dt_now, dt_ts
 logger = logging.getLogger(__name__)
 
 CHART_WARMUP_CANDLES = 120
+CHART_OHLCV_CACHE_TTL_SECONDS = 5
 SIGNAL_COLUMNS = ["enter_long", "exit_long", "enter_short", "exit_short"]
 STRATEGY_OVERLAY_HIDDEN_WARNING = (
     "Strategy overlay hidden: chart timeframe is higher than strategy timeframe."
 )
+_chart_ohlcv_cache: dict[tuple[int, str, str, CandleType, int, str], tuple[float, DataFrame]] = {}
+
+
+def clear_chart_ohlcv_cache() -> None:
+    _chart_ohlcv_cache.clear()
 
 
 def load_chart_ohlcv(
-    exchange: Any, config: dict[str, Any], pair: str, timeframe: str, limit: int
+    exchange: Any,
+    config: dict[str, Any],
+    pair: str,
+    timeframe: str,
+    limit: int,
+    candle_mode: str = "closed",
 ) -> DataFrame:
     candles_to_request = limit + CHART_WARMUP_CANDLES
     since_ms = dt_ts(date_minus_candles(timeframe, candles_to_request, dt_now()))
+    candle_type = config.get("candle_type_def", CandleType.SPOT)
+
+    if candle_mode == "live":
+        return _load_live_chart_ohlcv(
+            exchange,
+            pair,
+            timeframe,
+            candles_to_request,
+            since_ms,
+            candle_type,
+        )
 
     dataframe = exchange.get_historic_ohlcv(
         pair=pair,
         timeframe=timeframe,
         since_ms=since_ms,
         is_new_pair=True,
-        candle_type=config.get("candle_type_def", CandleType.SPOT),
+        candle_type=candle_type,
     )
     return dataframe.loc[:, DEFAULT_DATAFRAME_COLUMNS].tail(candles_to_request).reset_index(
         drop=True
     )
+
+
+def _load_live_chart_ohlcv(
+    exchange: Any,
+    pair: str,
+    timeframe: str,
+    candles_to_request: int,
+    since_ms: int,
+    candle_type: CandleType,
+) -> DataFrame:
+    cache_key = (id(exchange), pair, timeframe, candle_type, candles_to_request, "live")
+    cached = _chart_ohlcv_cache.get(cache_key)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1].copy()
+
+    pair_key = (pair, timeframe, candle_type)
+    dataframes = exchange.refresh_latest_ohlcv(
+        [pair_key],
+        since_ms=since_ms,
+        cache=False,
+        drop_incomplete=False,
+    )
+    if pair_key not in dataframes:
+        raise RuntimeError(f"No OHLCV data returned for {pair} {timeframe} {candle_type}")
+
+    dataframe = dataframes[pair_key]
+    result = dataframe.loc[:, DEFAULT_DATAFRAME_COLUMNS].tail(candles_to_request).reset_index(
+        drop=True
+    )
+    _chart_ohlcv_cache[cache_key] = (
+        now + CHART_OHLCV_CACHE_TTL_SECONDS,
+        result.copy(),
+    )
+    return result
 
 
 def merge_strategy_overlay(
@@ -143,6 +201,7 @@ def build_chart_candles_response(
         payload.pair,
         payload.timeframe,
         payload.limit,
+        payload.candle_mode,
     )
     chart_dataframe = add_watch_indicators(chart_dataframe, payload.watch_indicators)
     plot_config = build_watch_plot_config(payload.watch_indicators)
@@ -210,6 +269,9 @@ def build_chart_candles_response(
             "overlay": overlay.model_dump() if overlay else None,
             "plot_config": plot_config,
             "warnings": warnings,
+            "candle_mode": payload.candle_mode,
+            "last_candle_complete": payload.candle_mode == "closed"
+            or _last_candle_complete(chart_dataframe, payload.timeframe),
         }
     )
     return response
@@ -290,6 +352,14 @@ def _date_merge_key(dataframe: DataFrame) -> pd.Series:
 
 def _trim_to_limit(dataframe: DataFrame, limit: int) -> DataFrame:
     return dataframe.tail(limit).reset_index(drop=True)
+
+
+def _last_candle_complete(dataframe: DataFrame, timeframe: str) -> bool:
+    if dataframe.empty:
+        return True
+    candle_open = pd.to_datetime(dataframe.iloc[-1]["date"], utc=True)
+    candle_close_ms = int(candle_open.timestamp() * 1000) + timeframe_to_msecs(timeframe)
+    return candle_close_ms <= dt_ts(dt_now())
 
 
 def _ensure_signal_columns(dataframe: DataFrame) -> DataFrame:
