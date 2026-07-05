@@ -1,3 +1,4 @@
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -120,6 +121,58 @@ def test_research_chart_candles_returns_pair_history_shape(research_client) -> N
     assert body["pair"] == "600519.SH"
     assert body["length"] == 2
     assert body["meta"]["layers"][0]["source"] == "market"
+
+
+def test_research_chart_candles_missing_ohlcv_does_not_leak_local_path(
+    research_client,
+    tmp_path,
+) -> None:
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/chart_candles",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "600519.SH",
+            "timeframe": "5m",
+        },
+    )
+
+    response_text = response.text
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Research OHLCV not found for 600519.SH 5m"
+    assert str(tmp_path) not in response_text
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"[A-Za-z]:", response_text) is None
+
+
+def test_research_chart_candles_unexpected_error_does_not_leak_detail(
+    research_client,
+    mocker,
+) -> None:
+    mocker.patch(
+        "freqtrade.rpc.api_server.api_research.build_research_chart_candles_response",
+        side_effect=RuntimeError(r"G:\private\research_data\data_root\600519.SH-1d.csv"),
+    )
+
+    response = client_post(
+        research_client,
+        f"{BASE_URI}/research/chart_candles",
+        data={
+            "bot_id": "a-share-local",
+            "instrument": "600519.SH",
+            "timeframe": "1d",
+        },
+    )
+
+    response_text = response.text
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Research chart data unavailable"
+    assert "research_data" not in response_text
+    assert "data_root" not in response_text
+    assert "\\" not in response_text
+    assert re.search(r"[A-Za-z]:", response_text) is None
 
 
 def test_research_unknown_bot_returns_404(research_client) -> None:

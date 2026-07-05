@@ -58,13 +58,16 @@ def research_chart_candles(
     profile = _get_research_profile(config, payload.bot_id)
     try:
         return build_research_chart_candles_response(profile, payload)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Research OHLCV not found for {payload.instrument} {payload.timeframe}",
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
+    except Exception:
         logger.exception("Error in research_chart_candles")
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail="Research chart data unavailable")
 
 
 def _get_research_profile(config: dict, bot_id: str) -> ResearchBotProfile:
