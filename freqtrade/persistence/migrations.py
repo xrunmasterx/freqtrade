@@ -54,6 +54,7 @@ def set_sequence_ids(
     kv_id: int | None = None,
     custom_data_id: int | None = None,
     wallet_history_id: int | None = None,
+    decision_snapshot_id: int | None = None,
 ):
     """
     Set sequence ids to the given values.
@@ -66,6 +67,7 @@ def set_sequence_ids(
     :param kv_id: value to set for KeyValueStore_id_seq (optional)
     :param custom_data_id: value to set for trade_custom_data_id_seq (optional)
     :param wallet_history_id: value to set for wallet_history_id_seq (optional)
+    :param decision_snapshot_id: value to set for decision_snapshots_id_seq (optional)
     """
     if engine.name == "postgresql":
         with engine.begin() as connection:
@@ -88,6 +90,13 @@ def set_sequence_ids(
             if wallet_history_id:
                 connection.execute(
                     text(f"ALTER SEQUENCE wallet_history_id_seq RESTART WITH {wallet_history_id}")
+                )
+            if decision_snapshot_id:
+                connection.execute(
+                    text(
+                        "ALTER SEQUENCE decision_snapshots_id_seq "
+                        f"RESTART WITH {decision_snapshot_id}"
+                    )
                 )
 
 
@@ -348,6 +357,12 @@ def migrate_kv_store_table(decl_base, inspector, engine, kv_store_back_name: str
     set_sequence_ids(engine, kv_id=kv_store_id)
 
 
+def create_decision_snapshots_table(decl_base, engine) -> None:
+    decision_snapshots = decl_base.metadata.tables.get("decision_snapshots")
+    if decision_snapshots is not None:
+        decision_snapshots.create(bind=engine, checkfirst=True)
+
+
 def set_sqlite_to_wal(engine):
     if engine.name == "sqlite" and str(engine.url) != "sqlite://":
         # Set Mode to
@@ -473,6 +488,9 @@ def check_migrate(engine: Engine, decl_base, previous_tables: list[str]) -> None
             "Please update to freqtrade 2022.3 to migrate this database or "
             "start with a fresh database."
         )
+
+    if "decision_snapshots" not in previous_tables:
+        create_decision_snapshots_table(decl_base, engine)
 
     set_sqlite_to_wal(engine)
     fix_old_dry_orders(engine)

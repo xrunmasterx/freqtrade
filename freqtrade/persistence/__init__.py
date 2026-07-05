@@ -1,6 +1,7 @@
 # flake8: noqa: F401
 
 from freqtrade.persistence.custom_data import CustomDataWrapper
+from freqtrade.persistence.decision_snapshot_model import DecisionSnapshot
 from freqtrade.persistence.key_value_store import KeyStoreKeys, KeyValueStore
 from freqtrade.persistence.models import init_db
 from freqtrade.persistence.pairlock_middleware import PairLocks

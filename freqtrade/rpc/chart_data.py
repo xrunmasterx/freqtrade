@@ -23,6 +23,10 @@ from freqtrade.rpc.api_server.api_schemas import (
 )
 from freqtrade.rpc.chart_composition import ChartComposition, ChartFrame, ChartLayer
 from freqtrade.rpc.chart_indicators import add_watch_indicators, build_watch_plot_config
+from freqtrade.rpc.decision_snapshots import (
+    build_decision_snapshot_layer,
+    load_decision_snapshots_for_window,
+)
 from freqtrade.util.datetime_helpers import dt_now, dt_ts
 
 
@@ -345,6 +349,10 @@ def _build_chart_response_meta(
     if strategy_layer:
         layers.append(strategy_layer)
 
+    decision_snapshot_layer = _build_decision_snapshot_layer_meta(dataframe, payload)
+    if decision_snapshot_layer:
+        layers.append(decision_snapshot_layer)
+
     meta_warnings = list(warnings)
     for layer in layers:
         meta_warnings.extend(layer.warnings)
@@ -362,6 +370,37 @@ def _build_chart_response_meta(
         layers=layers,
         warnings=list(dict.fromkeys(meta_warnings)),
     )
+
+
+def _build_decision_snapshot_layer_meta(
+    dataframe: DataFrame,
+    payload: ChartCandlesRequest,
+) -> ChartLayerMeta | None:
+    if dataframe.empty:
+        return None
+
+    warning = f"Decision snapshot layer unavailable for {payload.pair} {payload.timeframe}"
+    try:
+        decision_snapshots = load_decision_snapshots_for_window(
+            payload.pair,
+            payload.timeframe,
+            pd.to_datetime(dataframe.iloc[0]["date"], utc=True).to_pydatetime(),
+            pd.to_datetime(dataframe.iloc[-1]["date"], utc=True).to_pydatetime(),
+        )
+        if not decision_snapshots:
+            return None
+        return build_decision_snapshot_layer(decision_snapshots, dataframe)
+    except Exception:
+        logger.warning(warning, exc_info=True)
+        return ChartLayerMeta(
+            id="decision_snapshot.evidence",
+            source="decision_snapshot",
+            status="unavailable",
+            label="Bot Decision",
+            timeframe=payload.timeframe,
+            alignment="candle_open",
+            warnings=[warning],
+        )
 
 
 def _build_composition_layers(

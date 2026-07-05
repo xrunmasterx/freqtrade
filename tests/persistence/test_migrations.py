@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.schema import CreateTable
 
 from freqtrade.constants import DEFAULT_DB_PROD_URL
@@ -391,11 +391,12 @@ def test_migrate_set_sequence_ids():
         kv_id=3,
         custom_data_id=10,
         wallet_history_id=15,
+        decision_snapshot_id=20,
     )
 
     # begin called once and connection.execute invoked for each provided sequence id
     assert engine.begin.call_count == 1
-    assert conn.execute.call_count == 6
+    assert conn.execute.call_count == 7
     assert (
         conn.execute.call_args_list[0][0][0].text == "ALTER SEQUENCE orders_id_seq RESTART WITH 22"
     )
@@ -418,6 +419,10 @@ def test_migrate_set_sequence_ids():
     assert (
         conn.execute.call_args_list[5][0][0].text
         == "ALTER SEQUENCE wallet_history_id_seq RESTART WITH 15"
+    )
+    assert (
+        conn.execute.call_args_list[6][0][0].text
+        == "ALTER SEQUENCE decision_snapshots_id_seq RESTART WITH 20"
     )
 
     engine.reset_mock()
@@ -476,6 +481,21 @@ def test_migrate_pairlocks(mocker, default_conf, fee, caplog):
     assert len(pairlocks) == 1
     assert pairlocks[0].pair == "ETH/BTC"
     assert pairlocks[0].side == "*"
+
+
+def test_init_db_creates_decision_snapshots_for_existing_db_without_table(mocker, default_conf):
+    engine = create_engine("sqlite://")
+    ModelBase.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE decision_snapshots"))
+    assert "decision_snapshots" not in inspect(engine).get_table_names()
+
+    mocker.patch("freqtrade.persistence.models.create_engine", lambda *args, **kwargs: engine)
+
+    init_db(default_conf["db_url"])
+
+    table_names = inspect(engine).get_table_names()
+    assert "decision_snapshots" in table_names
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from sqlalchemy.orm import make_transient
 
 from freqtrade.persistence.base import SessionType
 from freqtrade.persistence.custom_data import _CustomData
+from freqtrade.persistence.decision_snapshot_model import DecisionSnapshot
 from freqtrade.persistence.key_value_store import _KeyValueStoreModel
 from freqtrade.persistence.migrations import set_sequence_ids
 from freqtrade.persistence.pairlock import PairLock
@@ -22,6 +23,7 @@ def migrate_db(session_target: SessionType):
     kv_count = 0
     custom_data_count = 0
     wallet_history_count = 0
+    decision_snapshot_count = 0
     for trade in Trade.get_trades():
         trade_count += 1
         make_transient(trade)
@@ -56,6 +58,12 @@ def migrate_db(session_target: SessionType):
         session_target.add(wh)
     session_target.commit()
 
+    for snapshot in DecisionSnapshot.session.scalars(select(DecisionSnapshot)):
+        decision_snapshot_count += 1
+        make_transient(snapshot)
+        session_target.add(snapshot)
+    session_target.commit()
+
     # Update sequences
     max_trade_id = session_target.scalar(select(func.max(Trade.id)))
     max_order_id = session_target.scalar(select(func.max(Order.id)))
@@ -63,6 +71,7 @@ def migrate_db(session_target: SessionType):
     max_kv_id = session_target.scalar(select(func.max(_KeyValueStoreModel.id)))
     max_custom_data_id = session_target.scalar(select(func.max(_CustomData.id)))
     max_wallet_history_id = session_target.scalar(select(func.max(WalletHistory.id)))
+    max_decision_snapshot_id = session_target.scalar(select(func.max(DecisionSnapshot.id)))
 
     set_sequence_ids(
         session_target.get_bind(),
@@ -72,10 +81,12 @@ def migrate_db(session_target: SessionType):
         kv_id=(max_kv_id or 0) + 1,
         custom_data_id=(max_custom_data_id or 0) + 1,
         wallet_history_id=(max_wallet_history_id or 0) + 1,
+        decision_snapshot_id=(max_decision_snapshot_id or 0) + 1,
     )
 
     logger.info(
         f"Migrated {trade_count} Trades, {pairlock_count} Pairlocks, "
         f"{kv_count} Key-Value pairs, {custom_data_count} Custom Data entries, "
-        f"and {wallet_history_count} Wallet History entries."
+        f"{wallet_history_count} Wallet History entries, and "
+        f"{decision_snapshot_count} Decision Snapshot entries."
     )

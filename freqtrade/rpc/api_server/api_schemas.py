@@ -702,6 +702,12 @@ class ChartSeriesMeta(BaseModel):
     provisional: bool = False
 
 
+class ChartLayerPoint(BaseModel):
+    timestamp: int
+    label: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class ChartLayerMeta(BaseModel):
     id: str
     source: Literal[
@@ -717,6 +723,7 @@ class ChartLayerMeta(BaseModel):
     timeframe: str | None = None
     alignment: str | None = None
     series: list[ChartSeriesMeta] = Field(default_factory=list)
+    points: list[ChartLayerPoint] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

@@ -6,6 +6,7 @@ import pytest
 
 from freqtrade.enums import CandleType
 from freqtrade.exchange import date_minus_candles
+from freqtrade.persistence import DecisionSnapshot
 from freqtrade.rpc.api_server.api_schemas import ChartCandlesRequest
 from freqtrade.rpc.chart_data import (
     CHART_WARMUP_CANDLES,
@@ -666,6 +667,141 @@ def test_chart_meta_omits_empty_ok_strategy_layer_when_overlay_has_no_plot_colum
     response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
 
     assert not any(layer["source"] == "strategy" for layer in response["meta"]["layers"])
+
+
+def test_build_chart_candles_response_includes_decision_snapshot_layer_when_snapshots_exist(
+    mocker,
+):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    snapshot_candle = chart_df.tail(50).iloc[0]["date"].to_pydatetime()
+    snapshot = DecisionSnapshot(
+        pair="BTC/USDT",
+        timeframe="15m",
+        candle_open=snapshot_candle,
+        decision_time=snapshot_candle,
+        strategy="StrategyUnderTest",
+        snapshot_type="live",
+        decision="enter_long",
+        values={"rsi": 42.5},
+        context={},
+    )
+    load_snapshots = mocker.patch(
+        "freqtrade.rpc.chart_data.load_decision_snapshots_for_window",
+        return_value=[snapshot],
+    )
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    load_snapshots.assert_called_once()
+    decision_layer = _meta_layer(response, "decision_snapshot")
+    assert decision_layer["status"] == "ok"
+    assert decision_layer["label"] == "Bot Decision"
+    assert decision_layer["series"][0]["label"] == "RSI - Decision Snapshot"
+
+
+def test_build_chart_candles_response_omits_decision_snapshot_layer_when_loader_empty(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    mocker.patch("freqtrade.rpc.chart_data.load_decision_snapshots_for_window", return_value=[])
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+
+    response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert not any(layer["source"] == "decision_snapshot" for layer in response["meta"]["layers"])
+
+
+def test_decision_snapshot_layer_does_not_change_legacy_chart_payload(mocker):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    snapshot_candle = chart_df.tail(50).iloc[0]["date"].to_pydatetime()
+    snapshot = DecisionSnapshot(
+        pair="BTC/USDT",
+        timeframe="15m",
+        candle_open=snapshot_candle,
+        decision_time=snapshot_candle,
+        strategy="StrategyUnderTest",
+        snapshot_type="live",
+        decision="enter_long",
+        values={"rsi": 42.5},
+        context={},
+    )
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+    load_snapshots = mocker.patch(
+        "freqtrade.rpc.chart_data.load_decision_snapshots_for_window",
+        side_effect=[[], [snapshot]],
+    )
+
+    baseline_response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+    snapshot_response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert load_snapshots.call_count == 2
+    assert not any(
+        layer["source"] == "decision_snapshot" for layer in baseline_response["meta"]["layers"]
+    )
+    assert any(
+        layer["source"] == "decision_snapshot" for layer in snapshot_response["meta"]["layers"]
+    )
+    assert snapshot_response["columns"] == baseline_response["columns"]
+    assert snapshot_response["data"] == baseline_response["data"]
+    assert snapshot_response["plot_config"] == baseline_response["plot_config"]
+
+
+def test_decision_snapshot_failure_keeps_legacy_chart_payload_and_reports_warning(mocker, caplog):
+    chart_df = generate_test_data("15m", 170, "2024-01-01 00:00:00+00:00")
+    rpc = MagicMock()
+    rpc._freqtrade.exchange.get_historic_ohlcv.return_value = chart_df
+    rpc._freqtrade.config = {
+        "strategy": "StrategyUnderTest",
+        "timeframe": "1h",
+        "candle_type_def": CandleType.SPOT,
+    }
+    request = ChartCandlesRequest(
+        pair="BTC/USDT", timeframe="15m", limit=50, include_strategy_overlay=False
+    )
+    load_snapshots = mocker.patch(
+        "freqtrade.rpc.chart_data.load_decision_snapshots_for_window",
+        side_effect=[[], RuntimeError("snapshot sidecar down")],
+    )
+    caplog.set_level(logging.WARNING, logger="freqtrade.rpc.chart_data")
+
+    baseline_response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+    failed_sidecar_response = build_chart_candles_response(rpc, rpc._freqtrade.config, request)
+
+    assert load_snapshots.call_count == 2
+    assert failed_sidecar_response["columns"] == baseline_response["columns"]
+    assert failed_sidecar_response["data"] == baseline_response["data"]
+    assert failed_sidecar_response["plot_config"] == baseline_response["plot_config"]
+    assert "Decision snapshot layer unavailable for BTC/USDT 15m" in caplog.text
+    assert (
+        "Decision snapshot layer unavailable for BTC/USDT 15m"
+        in failed_sidecar_response["meta"]["warnings"]
+    )
 
 
 def test_build_chart_candles_response_propagates_ohlcv_failures(mocker):
