@@ -71,6 +71,18 @@ def is_webserver_mode(config=Depends(get_config)):
     return None
 
 
+def is_research_mode(config=Depends(get_config)):
+    if config["runmode"] != RunMode.WEBSERVER or not config.get("research_bots"):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "research_api_disabled",
+                "message": "Research API is not enabled.",
+            },
+        )
+    return None
+
+
 def is_trading_mode(config=Depends(get_config)):
     if config["runmode"] not in TRADE_MODES:
         raise HTTPException(status_code=503, detail="Bot is not in the correct state.")

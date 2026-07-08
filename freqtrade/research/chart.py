@@ -8,8 +8,15 @@ from typing import Any
 import pandas as pd
 from pandas import DataFrame
 
-from freqtrade.research import LocalCsvResearchDataSource, ResearchBotProfile
+from freqtrade.markets import MarketType
+from freqtrade.research import ResearchBotProfile, create_research_data_source
+from freqtrade.research.a_share_timeframes import is_a_share_minute_timeframe
+from freqtrade.research.exceptions import ResearchUnsupportedFeatureError
+from freqtrade.research.side_data.chart_layers import apply_side_data_chart_layers
+from freqtrade.research.side_data.store import LocalResearchSideDataStore
+from freqtrade.research.windowing import apply_research_timerange
 from freqtrade.rpc.api_server.api_schemas import (
+    ChartAxisMeta,
     ChartLayerMeta,
     ChartResponseMeta,
     ChartSeriesCoverage,
@@ -35,19 +42,49 @@ def build_research_chart_candles_response(
     profile: ResearchBotProfile,
     payload: ResearchChartCandlesRequest,
 ) -> dict[str, Any]:
-    dataframe = LocalCsvResearchDataSource(profile.data_root).load_ohlcv(
+    data_source = create_research_data_source(profile)
+    dataframe = data_source.load_ohlcv(
         payload.instrument,
         payload.timeframe,
+        payload.adjustment,
     )
+    provenance = data_source.get_ohlcv_provenance(
+        payload.instrument,
+        payload.timeframe,
+        payload.adjustment,
+    )
+    dataframe = apply_research_timerange(dataframe, payload.timerange)
     dataframe = dataframe.tail(payload.limit).reset_index(drop=True)
     dataframe = add_watch_indicators(dataframe, payload.watch_indicators)
     plot_config = build_watch_plot_config(payload.watch_indicators)
-    meta = _build_research_chart_response_meta(dataframe, payload, plot_config)
+    side_layers: list[ChartLayerMeta] = []
+    if payload.side_layers and is_a_share_minute_timeframe(payload.timeframe):
+        raise ResearchUnsupportedFeatureError("Research side layers support 1d only.")
+    if payload.side_layers and profile.side_data is not None and profile.side_data_root is not None:
+        dataframe, side_plot_config, side_layers = apply_side_data_chart_layers(
+            dataframe,
+            LocalResearchSideDataStore(
+                profile.side_data_root,
+                enabled_datasets=profile.side_data.enabled_datasets,
+            ),
+            payload.instrument,
+            payload.side_layers,
+        )
+        _merge_plot_config(plot_config, side_plot_config)
+    meta = _build_research_chart_response_meta(
+        dataframe,
+        profile,
+        payload,
+        plot_config,
+        provenance,
+        side_layers=side_layers,
+    )
 
     response = _convert_research_dataframe_to_dict(
         instrument=payload.instrument,
         timeframe=payload.timeframe,
         dataframe=dataframe,
+        axis_meta=meta.axis,
         last_analyzed=dt_now(),
     )
     response.update(
@@ -69,6 +106,7 @@ def _convert_research_dataframe_to_dict(
     instrument: str,
     timeframe: str,
     dataframe: DataFrame,
+    axis_meta: ChartAxisMeta | None,
     last_analyzed: datetime,
 ) -> dict[str, Any]:
     response_dataframe = dataframe.copy()
@@ -88,6 +126,16 @@ def _convert_research_dataframe_to_dict(
             response_dataframe.loc[mask, f"_{signal_column}_signal_close"] = response_dataframe.loc[
                 mask, "close"
             ]
+
+    if axis_meta is not None and axis_meta.source_column not in response_dataframe.columns:
+        response_dataframe.loc[:, axis_meta.source_column] = []
+
+    if (
+        axis_meta is not None
+        and axis_meta.mode == "trading_session"
+        and axis_meta.display_column is not None
+    ):
+        response_dataframe.loc[:, axis_meta.display_column] = range(len(response_dataframe))
 
     result = {
         "pair": instrument,
@@ -131,12 +179,16 @@ def _convert_research_dataframe_to_dict(
 
 def _build_research_chart_response_meta(
     dataframe: DataFrame,
+    profile: ResearchBotProfile,
     payload: ResearchChartCandlesRequest,
     plot_config: dict[str, Any],
+    provenance: Any,
+    side_layers: list[ChartLayerMeta] | None = None,
 ) -> ChartResponseMeta:
     layers = [
         _build_market_layer_meta(dataframe, payload.timeframe),
         _build_watch_layer_meta(dataframe, plot_config, payload.timeframe),
+        *(side_layers or []),
     ]
     warnings = []
     for layer in layers:
@@ -151,9 +203,35 @@ def _build_research_chart_response_meta(
             data_stop=_date_string(dataframe.iloc[-1]["date"]) if not dataframe.empty else None,
             last_candle_complete=True,
         ),
+        axis=_chart_axis_meta(profile),
         layers=layers,
         warnings=list(dict.fromkeys(warnings)),
+        data_provenance=provenance.model_dump(),
     )
+
+
+def _chart_axis_meta(profile: ResearchBotProfile) -> ChartAxisMeta:
+    if profile.market == MarketType.A_SHARE:
+        return ChartAxisMeta(
+            mode="trading_session",
+            source_column="__date_ts",
+            display_column="__display_x",
+            timezone="Asia/Shanghai",
+        )
+    return ChartAxisMeta(mode="time", source_column="__date_ts")
+
+
+def _merge_plot_config(target: dict[str, Any], update: dict[str, Any]) -> None:
+    for key in ("main_plot", "subplots"):
+        target_section = target.setdefault(key, {})
+        update_section = update.get(key, {})
+        if not isinstance(update_section, dict):
+            continue
+        for name, value in update_section.items():
+            if isinstance(value, dict) and isinstance(target_section.get(name), dict):
+                target_section[name].update(value)
+            else:
+                target_section[name] = value
 
 
 def _build_market_layer_meta(dataframe: DataFrame, timeframe: str) -> ChartLayerMeta:

@@ -7,6 +7,7 @@ from freqtrade.constants import DL_DATA_TIMEFRAMES, IntOrInf
 from freqtrade.enums import MarginMode, OrderTypeValues, SignalDirection, TradingMode
 from freqtrade.ft_types import AnnotationType, ValidExchangesType
 from freqtrade.markets import BotCapabilities, Instrument, MarketType
+from freqtrade.research.side_data.models import ResearchSideLayerSelection
 from freqtrade.rpc.api_server.webserver_bgwork import JOB_CATEGORIES, ProgressTask
 
 
@@ -657,6 +658,10 @@ class ChartCandlesRequest(BaseModel):
     candle_mode: Literal["closed", "live"] = "closed"
 
 
+class ResearchSideLayerRequest(ResearchSideLayerSelection):
+    pass
+
+
 class ResearchChartCandlesRequest(BaseModel):
     bot_id: str
     instrument: str
@@ -665,6 +670,20 @@ class ResearchChartCandlesRequest(BaseModel):
     timerange: str | None = None
     adjustment: Literal["raw", "qfq", "hfq"] = "raw"
     watch_indicators: ChartIndicatorRequest | None = None
+    side_layers: ResearchSideLayerSelection | None = None
+
+
+class ResearchFeatureFilterRequest(BaseModel):
+    dataset: Literal["fund_flow_daily"]
+    field: Literal[
+        "main_net_inflow",
+        "large_net_inflow",
+        "medium_net_inflow",
+        "small_net_inflow",
+    ]
+    operator: Literal[">", ">=", "<", "<=", "=="]
+    value: float = Field(allow_inf_nan=False)
+    missing: Literal["block", "allow"] = "block"
 
 
 class ResearchSmaCrossStrategyRequest(BaseModel):
@@ -679,15 +698,57 @@ class ResearchSmaCrossStrategyRequest(BaseModel):
         return self
 
 
+class ResearchSmaCrossFeatureFilterStrategyRequest(BaseModel):
+    type: Literal["sma_cross_feature_filter"] = "sma_cross_feature_filter"
+    fast: int = Field(default=20, ge=1)
+    slow: int = Field(default=60, ge=2)
+    feature_filter: ResearchFeatureFilterRequest
+
+    @model_validator(mode="after")
+    def validate_period_order(self):
+        if self.fast >= self.slow:
+            raise ValueError("SMA fast period must be less than slow period.")
+        return self
+
+
+ResearchBacktestStrategyRequest = Annotated[
+    ResearchSmaCrossStrategyRequest | ResearchSmaCrossFeatureFilterStrategyRequest,
+    Field(discriminator="type"),
+]
+
+
 class ResearchBacktestRequest(BaseModel):
     bot_id: str
     instrument: str
     timeframe: str
     timerange: str | None = None
-    strategy: ResearchSmaCrossStrategyRequest = Field(
+    adjustment: Literal["raw", "qfq", "hfq"] = "raw"
+    strategy: ResearchBacktestStrategyRequest = Field(
         default_factory=ResearchSmaCrossStrategyRequest
     )
     initial_cash: float = Field(default=100000, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_strategy_type(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        strategy = data.get("strategy")
+        if not isinstance(strategy, dict) or "type" in strategy:
+            return data
+
+        allowed_legacy_sma_keys = {"fast", "slow"}
+        if not set(strategy).issubset(allowed_legacy_sma_keys):
+            return data
+
+        return {
+            **data,
+            "strategy": {
+                "type": "sma_cross",
+                **strategy,
+            },
+        }
 
 
 class ResearchBotResponse(BaseModel):
@@ -701,8 +762,32 @@ class ResearchBotsResponse(BaseModel):
     bots: list[ResearchBotResponse]
 
 
+class ResearchInstrumentResponse(Instrument):
+    available_timeframes: list[str] = Field(default_factory=list)
+
+
 class ResearchInstrumentsResponse(BaseModel):
-    instruments: list[Instrument]
+    instruments: list[ResearchInstrumentResponse]
+
+
+class ResearchDatasetResponse(BaseModel):
+    dataset_id: str
+    kind: Literal["feature", "event", "document"]
+    market: Literal["a_share"]
+    scope: Literal["instrument", "market", "sector"]
+    storage_format: Literal["csv", "jsonl"]
+    timeframe: str | None = None
+    available: bool = False
+    start: str | None = None
+    stop: str | None = None
+    provider: str | None = None
+    provider_version: str | None = None
+    manifest_run_id: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ResearchDatasetsResponse(BaseModel):
+    datasets: list[ResearchDatasetResponse]
 
 
 class ChartOverlayMeta(BaseModel):
@@ -721,6 +806,13 @@ class ChartWindowMeta(BaseModel):
     data_start: str | None = None
     data_stop: str | None = None
     last_candle_complete: bool = True
+
+
+class ChartAxisMeta(BaseModel):
+    mode: Literal["time", "trading_session"] = "time"
+    source_column: str = "__date_ts"
+    display_column: str | None = None
+    timezone: str | None = None
 
 
 class ChartSeriesCoverage(BaseModel):
@@ -742,6 +834,9 @@ class ChartSeriesMeta(BaseModel):
         "execution",
         "decision_snapshot",
         "recomputed",
+        "feature",
+        "event",
+        "document",
     ]
     kind: str
     panel: str
@@ -766,6 +861,9 @@ class ChartLayerMeta(BaseModel):
         "execution",
         "decision_snapshot",
         "recomputed",
+        "feature",
+        "event",
+        "document",
     ]
     status: Literal["ok", "partial", "hidden", "unavailable", "stale", "provisional"]
     label: str
@@ -779,8 +877,10 @@ class ChartLayerMeta(BaseModel):
 class ChartResponseMeta(BaseModel):
     schema_version: int = 1
     window: ChartWindowMeta
+    axis: ChartAxisMeta | None = None
     layers: list[ChartLayerMeta] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    data_provenance: dict[str, Any] | None = None
 
 
 class PairHistoryRequest(PairCandlesRequest, ExchangeModePayloadMixin):

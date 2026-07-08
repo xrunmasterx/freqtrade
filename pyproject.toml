@@ -76,6 +76,9 @@ dependencies = [
 [project.optional-dependencies]
 # Requirements used for submodules
 plot = ["plotly>=4.0"]
+research_ashare = [
+  "akshare",
+]
 hyperopt = [
   "cmaes",
   "filelock",

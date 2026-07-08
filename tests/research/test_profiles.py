@@ -1,5 +1,10 @@
+from pathlib import Path
+
+import pytest
+
 from freqtrade.markets import MarketType
 from freqtrade.research import load_research_profiles
+from freqtrade.research.exceptions import ResearchConfigError
 
 
 def test_load_research_profiles_parses_local_csv_profile(tmp_path) -> None:
@@ -35,3 +40,145 @@ def test_load_research_profiles_returns_empty_list_without_research_bots(tmp_pat
     config = {"user_data_dir": tmp_path}
 
     assert load_research_profiles(config) == []
+
+
+def test_load_research_profiles_accepts_optional_market_and_side_data(tmp_path) -> None:
+    config = {
+        "user_data_dir": tmp_path,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+                "data_source": {"type": "local_csv", "root": "research_data/a_share"},
+                "market_data": {
+                    "meta_root": "research_data/a_share_meta",
+                    "calendar": "calendar/trade_dates.csv",
+                    "daily_status": "status/daily_status.csv",
+                },
+                "side_data": {
+                    "root": "research_data/a_share_meta",
+                    "enabled_datasets": ["fund_flow_daily", "limit_pool"],
+                },
+            }
+        ],
+    }
+
+    profile = load_research_profiles(config)[0]
+
+    assert profile.market_data is not None
+    assert profile.market_data_root == tmp_path / "research_data" / "a_share_meta"
+    assert profile.market_data.calendar == "calendar/trade_dates.csv"
+    assert profile.market_data.daily_status == "status/daily_status.csv"
+    assert profile.side_data is not None
+    assert profile.side_data_root == tmp_path / "research_data" / "a_share_meta"
+    assert profile.side_data.enabled_datasets == ["fund_flow_daily", "limit_pool"]
+
+
+@pytest.mark.parametrize(
+    ("config_key", "config_value", "error_location"),
+    [
+        (
+            "market_data",
+            {"meta_root": "../a_share_meta"},
+            r"Invalid research_bots\[0\]\.market_data\.meta_root",
+        ),
+        (
+            "market_data",
+            {"meta_root": str((Path.cwd() / "a_share_meta").resolve())},
+            r"Invalid research_bots\[0\]\.market_data\.meta_root",
+        ),
+        (
+            "side_data",
+            {"root": "../side_data"},
+            r"Invalid research_bots\[0\]\.side_data\.root",
+        ),
+        (
+            "side_data",
+            {"root": str((Path.cwd() / "side_data").resolve())},
+            r"Invalid research_bots\[0\]\.side_data\.root",
+        ),
+    ],
+)
+def test_load_research_profiles_rejects_market_and_side_roots_outside_user_data_dir(
+    tmp_path,
+    config_key,
+    config_value,
+    error_location,
+) -> None:
+    config = {
+        "user_data_dir": tmp_path,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+                "data_source": {"type": "local_csv", "root": "research_data/a_share"},
+                config_key: config_value,
+            }
+        ],
+    }
+
+    with pytest.raises(ResearchConfigError, match=error_location):
+        load_research_profiles(config)
+
+
+def test_load_research_profiles_reports_missing_data_source_location(tmp_path) -> None:
+    config = {
+        "user_data_dir": tmp_path,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+            }
+        ],
+    }
+
+    with pytest.raises(ResearchConfigError, match=r"Missing research_bots\[0\]\.data_source"):
+        load_research_profiles(config)
+
+
+def test_load_research_profiles_reports_missing_data_source_root_location(tmp_path) -> None:
+    config = {
+        "user_data_dir": tmp_path,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+                "data_source": {
+                    "type": "local_csv",
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(
+        ResearchConfigError,
+        match=r"Invalid research_bots\[0\]\.data_source\.root",
+    ):
+        load_research_profiles(config)
+
+
+def test_load_research_profiles_rejects_unsupported_market(tmp_path) -> None:
+    config = {
+        "user_data_dir": tmp_path,
+        "research_bots": [
+            {
+                "id": "hk-local",
+                "label": "HK Local",
+                "market": "hk_stock",
+                "data_source": {
+                    "type": "local_csv",
+                    "root": "research_data/hk",
+                },
+            }
+        ],
+    }
+
+    with pytest.raises(
+        ResearchConfigError,
+        match=r"Unsupported research_bots\[0\]\.market: hk_stock",
+    ):
+        load_research_profiles(config)

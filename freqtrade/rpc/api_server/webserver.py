@@ -218,7 +218,11 @@ class ApiServer(RPCHandler):
         from freqtrade.rpc.api_server.api_v1 import router_public as api_v1_public
         from freqtrade.rpc.api_server.api_webserver import router as api_webserver
         from freqtrade.rpc.api_server.api_ws import router as ws_router
-        from freqtrade.rpc.api_server.deps import is_trading_mode, is_webserver_mode
+        from freqtrade.rpc.api_server.deps import (
+            is_research_mode,
+            is_trading_mode,
+            is_webserver_mode,
+        )
         from freqtrade.rpc.api_server.web_ui import router_ui
 
         app.include_router(api_v1_public, prefix="/api/v1")
@@ -244,7 +248,7 @@ class ApiServer(RPCHandler):
             api_research,
             prefix="/api/v1",
             tags=["Research"],
-            dependencies=[Depends(http_basic_or_jwt_token)],
+            dependencies=[Depends(http_basic_or_jwt_token), Depends(is_research_mode)],
         )
         app.include_router(
             api_webserver,

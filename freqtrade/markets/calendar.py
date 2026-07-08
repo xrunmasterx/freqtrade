@@ -1,5 +1,9 @@
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+from freqtrade.markets.calendar_store import CachedAShareCalendar
 
 
 _ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -10,8 +14,30 @@ _AFTERNOON_END = time(15, 0)
 
 
 class AShareCalendar:
-    def __init__(self, closed_dates: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        closed_dates: set[str] | None = None,
+        cached_calendar: CachedAShareCalendar | None = None,
+    ) -> None:
         self.closed_dates = closed_dates or set()
+        self.cached_calendar = cached_calendar
+
+    def is_trading_day(self, value: date | datetime | str) -> bool:
+        if self.cached_calendar is not None:
+            return self.cached_calendar.is_trading_day(value)
+
+        trading_date = _to_shanghai_date(value)
+        return trading_date.weekday() < 5 and trading_date.isoformat() not in self.closed_dates
+
+    def next_trading_day(self, value: date | datetime | str) -> date:
+        if self.cached_calendar is not None:
+            return self.cached_calendar.next_trading_day(value)
+
+        candidate = _to_shanghai_date(value)
+        while True:
+            candidate = candidate + timedelta(days=1)
+            if self.is_trading_day(candidate):
+                return candidate
 
     def is_session_open(self, dt: datetime) -> bool:
         if dt.tzinfo is None:
@@ -19,7 +45,7 @@ class AShareCalendar:
 
         local_dt = dt.astimezone(_ASIA_SHANGHAI)
 
-        if local_dt.weekday() >= 5 or local_dt.date().isoformat() in self.closed_dates:
+        if not self.is_trading_day(local_dt):
             return False
 
         local_time = local_dt.time()
@@ -27,3 +53,10 @@ class AShareCalendar:
             _MORNING_START <= local_time < _MORNING_END
             or _AFTERNOON_START <= local_time < _AFTERNOON_END
         )
+
+
+def _to_shanghai_date(value: date | datetime | str) -> date:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert(_ASIA_SHANGHAI)
+    return timestamp.date()
