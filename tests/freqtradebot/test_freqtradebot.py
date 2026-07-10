@@ -4597,6 +4597,37 @@ def test_startup_update_open_orders_keeps_recent_missing_orders(
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_startup_update_open_orders_keeps_missing_orders_at_five_day_boundary(
+    mocker,
+    default_conf_usdt,
+    fee,
+    caplog,
+    time_machine,
+):
+    time_machine.move_to("2026-07-11 00:00:00 +00:00", tick=False)
+
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    create_mock_trades(fee)
+    freqtrade.config["dry_run"] = False
+
+    open_orders = Order.get_open_orders()
+    open_order_ids = {order.order_id for order in open_orders}
+    boundary_order_date = (dt_now() - timedelta(days=5)).replace(tzinfo=None)
+    for order in open_orders:
+        order.order_date = boundary_order_date
+    Trade.commit()
+
+    mocker.patch(f"{EXMS}.fetch_order", side_effect=InvalidOrderException("not found"))
+    cancel_mock = mocker.patch("freqtrade.freqtradebot.FreqtradeBot.handle_cancel_order")
+
+    freqtrade.startup_update_open_orders()
+
+    assert cancel_mock.call_count == 0
+    assert {order.order_id for order in Order.get_open_orders()} == open_order_ids
+    assert not log_has_re(r"Order is older than 5 days.*", caplog)
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_startup_backpopulate_precision(mocker, default_conf_usdt, fee, caplog):
     freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
     create_mock_trades_usdt(fee)
