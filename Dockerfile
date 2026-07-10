@@ -11,13 +11,11 @@ ENV FT_APP_ENV="docker"
 # Prepare environment
 RUN mkdir /freqtrade \
   && apt-get update \
-  && apt-get -y install --no-install-recommends sudo libatlas3-base curl sqlite3 libgomp1 \
+  && apt-get -y install --no-install-recommends libatlas3-base curl sqlite3 libgomp1 \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* \
-  && useradd -u 1000 -G sudo -U -m -s /bin/bash ftuser \
-  && chown ftuser:ftuser /freqtrade \
-  # Allow sudoers
-  && echo "ftuser ALL=(ALL) NOPASSWD: /bin/chown" >> /etc/sudoers
+  && useradd -u 1000 -U -m -s /bin/bash ftuser \
+  && chown ftuser:ftuser /freqtrade
 
 WORKDIR /freqtrade
 
