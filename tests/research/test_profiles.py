@@ -75,6 +75,144 @@ def test_load_research_profiles_accepts_optional_market_and_side_data(tmp_path) 
     assert profile.side_data.enabled_datasets == ["fund_flow_daily", "limit_pool"]
 
 
+def test_load_research_profiles_resolves_approved_external_input_root(tmp_path) -> None:
+    user_data_dir = tmp_path / "state"
+    input_root = tmp_path / "research-input"
+    input_root.mkdir()
+    config = {
+        "user_data_dir": user_data_dir,
+        "research_input_root": input_root,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+                "data_source": {"type": "local_csv", "root": "a_share"},
+                "market_data": {"meta_root": "a_share_meta"},
+                "side_data": {"root": "a_share_meta"},
+            }
+        ],
+    }
+
+    profile = load_research_profiles(config)[0]
+
+    assert profile.data_root == input_root / "a_share"
+    assert profile.market_data_root == input_root / "a_share_meta"
+    assert profile.side_data_root == input_root / "a_share_meta"
+
+
+def test_load_research_profiles_preserves_legacy_user_data_relative_roots(tmp_path) -> None:
+    config = {
+        "user_data_dir": tmp_path,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+                "data_source": {"type": "local_csv", "root": "research_data/a_share"},
+                "market_data": {"meta_root": "research_data/a_share_meta"},
+                "side_data": {"root": "research_data/a_share_meta"},
+            }
+        ],
+    }
+
+    profile = load_research_profiles(config)[0]
+
+    assert profile.data_root == tmp_path / "research_data" / "a_share"
+    assert profile.market_data_root == tmp_path / "research_data" / "a_share_meta"
+    assert profile.side_data_root == tmp_path / "research_data" / "a_share_meta"
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("data_source", "root"),
+        ("market_data", "meta_root"),
+        ("side_data", "root"),
+    ],
+)
+def test_load_research_profiles_rejects_input_child_traversal(tmp_path, section, field) -> None:
+    input_root = tmp_path / "research-input"
+    input_root.mkdir()
+    profile = {
+        "id": "a-share-local",
+        "label": "A Share Local",
+        "market": "a_share",
+        "data_source": {"type": "local_csv", "root": "a_share"},
+        "market_data": {"meta_root": "a_share_meta"},
+        "side_data": {"root": "a_share_meta"},
+    }
+    profile[section][field] = "nested/../escape"
+    config = {
+        "user_data_dir": tmp_path / "state",
+        "research_input_root": input_root,
+        "research_bots": [profile],
+    }
+
+    with pytest.raises(ResearchConfigError):
+        load_research_profiles(config)
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("data_source", "root"),
+        ("market_data", "meta_root"),
+        ("side_data", "root"),
+    ],
+)
+def test_load_research_profiles_rejects_absolute_child_outside_input_root(
+    tmp_path,
+    section,
+    field,
+) -> None:
+    input_root = tmp_path / "research-input"
+    input_root.mkdir()
+    profile = {
+        "id": "a-share-local",
+        "label": "A Share Local",
+        "market": "a_share",
+        "data_source": {"type": "local_csv", "root": "a_share"},
+        "market_data": {"meta_root": "a_share_meta"},
+        "side_data": {"root": "a_share_meta"},
+    }
+    profile[section][field] = str(tmp_path / "outside")
+    config = {
+        "user_data_dir": tmp_path / "state",
+        "research_input_root": input_root,
+        "research_bots": [profile],
+    }
+
+    with pytest.raises(ResearchConfigError):
+        load_research_profiles(config)
+
+
+def test_load_research_profiles_rejects_symbolic_link_escape_from_input_root(tmp_path) -> None:
+    input_root = tmp_path / "research-input"
+    outside = tmp_path / "outside"
+    input_root.mkdir()
+    outside.mkdir()
+    try:
+        (input_root / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+    config = {
+        "user_data_dir": tmp_path / "state",
+        "research_input_root": input_root,
+        "research_bots": [
+            {
+                "id": "a-share-local",
+                "label": "A Share Local",
+                "market": "a_share",
+                "data_source": {"type": "local_csv", "root": "linked"},
+            }
+        ],
+    }
+
+    with pytest.raises(ResearchConfigError):
+        load_research_profiles(config)
+
+
 @pytest.mark.parametrize(
     ("config_key", "config_value", "error_location"),
     [
