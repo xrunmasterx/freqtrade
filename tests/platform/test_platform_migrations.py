@@ -143,6 +143,7 @@ EXPECTED_COLUMNS = {
 }
 
 EXPECTED_TABLES = set(EXPECTED_COLUMNS)
+RUNTIME_TABLES = EXPECTED_TABLES - {"platform_catalog_revisions"}
 EXPECTED_NULLABLE_COLUMNS = {
     "platform_catalog_revisions": set(),
     "runtime_instances": {"retired_at"},
@@ -623,7 +624,10 @@ def test_offline_upgrade_emits_complete_registry_sql_without_connection(
     sql = output.getvalue()
     assert connection_attempted is False
     for table_name in EXPECTED_TABLES:
-        assert re.search(rf"CREATE TABLE(?: IF NOT EXISTS)? {table_name}\b", sql)
+        assert re.search(
+            rf"CREATE TABLE(?: IF NOT EXISTS)? (?:public\.)?{table_name}\b",
+            sql,
+        )
     assert "incompatible_platform_catalog_revisions" in sql
     assert sql.index("incompatible_platform_catalog_revisions") < sql.index(
         "CREATE TABLE runtime_instances"
@@ -631,6 +635,36 @@ def test_offline_upgrade_emits_complete_registry_sql_without_connection(
     assert "offline.invalid" not in sql
     assert "postgresql+psycopg" not in sql
     assert "password" not in sql.lower()
+
+
+def test_offline_migrations_pin_public_schema_and_preserve_catalog_on_downgrade() -> None:
+    upgrade_output = io.StringIO()
+    upgrade_config = Config(str(ALEMBIC_CONFIG_PATH), output_buffer=upgrade_output)
+    upgrade_config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql+psycopg://offline.invalid/platform_test_offline",
+    )
+    command.upgrade(upgrade_config, "head", sql=True)
+    upgrade_sql = upgrade_output.getvalue()
+
+    downgrade_output = io.StringIO()
+    downgrade_config = Config(str(ALEMBIC_CONFIG_PATH), output_buffer=downgrade_output)
+    downgrade_config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql+psycopg://offline.invalid/platform_test_offline",
+    )
+    command.downgrade(downgrade_config, "head:base", sql=True)
+    downgrade_sql = downgrade_output.getvalue()
+
+    controlled_search_path = "SET LOCAL search_path TO public, pg_catalog"
+    assert controlled_search_path in upgrade_sql
+    assert upgrade_sql.index(controlled_search_path) < upgrade_sql.index(
+        "CREATE TABLE runtime_instances"
+    )
+    assert controlled_search_path in downgrade_sql
+    assert "DROP TABLE platform_catalog_revisions" not in downgrade_sql
+    assert "DROP TABLE public.platform_catalog_revisions" not in downgrade_sql
+    assert "CREATE TABLE public.alembic_version" in upgrade_sql
 
 
 def test_alembic_configuration_contains_no_dsn_or_credentials() -> None:
@@ -702,7 +736,9 @@ def test_registry_downgrades_and_upgrades_again(postgres_url: str) -> None:
 
     engine = create_engine(postgres_url)
     try:
-        assert EXPECTED_TABLES.isdisjoint(inspect(engine).get_table_names())
+        table_names = set(inspect(engine).get_table_names(schema="public"))
+        assert RUNTIME_TABLES.isdisjoint(table_names)
+        assert "platform_catalog_revisions" in table_names
     finally:
         engine.dispose()
 
@@ -740,6 +776,71 @@ def test_upgrade_preserves_non_empty_catalog(postgres_url: str) -> None:
         assert row.revision_id == "catalog-revision-1"
         assert row.payload == {"schema_version": 1}
     finally:
+        engine.dispose()
+
+
+def test_downgrade_preserves_adopted_non_empty_catalog_exactly(postgres_url: str) -> None:
+    engine = create_engine(postgres_url)
+    catalog_metadata = MetaData()
+    catalog = Table(
+        "platform_catalog_revisions",
+        catalog_metadata,
+        Column("revision_id", String(128), primary_key=True),
+        Column("payload", JSON, nullable=False),
+        Column("created_at", DateTime(timezone=True), nullable=False),
+        schema="public",
+    )
+    expected_created_at = datetime(2026, 7, 13, tzinfo=UTC)
+    try:
+        catalog_metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                insert(catalog).values(
+                    revision_id="phase1-catalog-revision",
+                    payload={"schema_version": 1, "source": "phase1"},
+                    created_at=expected_created_at,
+                )
+            )
+
+        config = _alembic_config(postgres_url)
+        command.upgrade(config, "head")
+        command.downgrade(config, "base")
+
+        with engine.connect() as connection:
+            row = connection.execute(catalog.select()).one()
+        assert row.revision_id == "phase1-catalog-revision"
+        assert row.payload == {"schema_version": 1, "source": "phase1"}
+        assert row.created_at == expected_created_at
+        table_names = set(inspect(engine).get_table_names(schema="public"))
+        assert RUNTIME_TABLES.isdisjoint(table_names)
+    finally:
+        engine.dispose()
+
+
+def test_caller_search_path_cannot_redirect_migration_state(postgres_url: str) -> None:
+    engine = create_engine(postgres_url)
+    shadow_schema = "phase2a_shadow"
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f"CREATE SCHEMA {shadow_schema}")
+        redirected_url = sqlalchemy.engine.make_url(postgres_url).update_query_dict(
+            {"options": f"-csearch_path={shadow_schema},public"}
+        )
+        command.upgrade(
+            _alembic_config(redirected_url.render_as_string(hide_password=False)), "head"
+        )
+
+        schema = inspect(engine)
+        assert EXPECTED_TABLES <= set(schema.get_table_names(schema="public"))
+        assert schema.get_table_names(schema=shadow_schema) == []
+        with engine.connect() as connection:
+            version = connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one()
+        assert version == "20260712_0001"
+    finally:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {shadow_schema} CASCADE")
         engine.dispose()
 
 

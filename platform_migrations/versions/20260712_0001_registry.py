@@ -17,6 +17,20 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+_CONTROLLED_SCHEMA_SQL = r"""
+SET LOCAL search_path TO public, pg_catalog
+"""
+_CONTROLLED_SCHEMA_GUARD_SQL = r"""
+DO $controlled_schema$
+BEGIN
+    IF current_setting('search_path') <> 'public, pg_catalog'
+       OR to_regnamespace('public') IS NULL THEN
+        RAISE EXCEPTION 'platform_migration_schema_control_failed';
+    END IF;
+END
+$controlled_schema$
+"""
+
 _CATALOG_ADOPTION_SQL = r"""
 DO $catalog_adoption$
 DECLARE
@@ -26,7 +40,7 @@ DECLARE
 BEGIN
     catalog_oid := to_regclass('public.platform_catalog_revisions');
     IF catalog_oid IS NULL THEN
-        CREATE TABLE platform_catalog_revisions (
+        CREATE TABLE public.platform_catalog_revisions (
             revision_id varchar(128) NOT NULL,
             payload json NOT NULL,
             created_at timestamp with time zone NOT NULL,
@@ -134,7 +148,13 @@ def _adopt_or_create_catalog_table() -> None:
     op.execute(_CATALOG_ADOPTION_SQL)
 
 
+def _control_migration_schema() -> None:
+    op.execute(_CONTROLLED_SCHEMA_SQL)
+    op.execute(_CONTROLLED_SCHEMA_GUARD_SQL)
+
+
 def upgrade() -> None:
+    _control_migration_schema()
     _adopt_or_create_catalog_table()
     op.create_table(
         "runtime_instances",
@@ -384,6 +404,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _control_migration_schema()
     op.drop_table("runtime_audit_events")
     op.drop_table("runtime_access_requests")
     op.drop_table("runtime_endpoints")
@@ -392,4 +413,3 @@ def downgrade() -> None:
     op.drop_index("uq_runtime_attempt_active", table_name="runtime_attempts")
     op.drop_table("runtime_attempts")
     op.drop_table("runtime_instances")
-    op.drop_table("platform_catalog_revisions")

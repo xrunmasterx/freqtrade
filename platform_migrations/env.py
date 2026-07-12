@@ -15,6 +15,10 @@ _TEST_DATABASE_PATTERN = re.compile(r"^platform_test[a-z0-9_]*$")
 _DATABASE_OVERRIDE_QUERY_KEYS = {"database", "dbname"}
 
 
+def _include_object(_object, name: str | None, type_: str, _reflected: bool, _compare_to) -> bool:
+    return not (type_ == "table" and name == "alembic_version")
+
+
 def _database_url() -> tuple[str, bool]:
     configured_url = config.get_main_option("sqlalchemy.url")
     if configured_url:
@@ -52,6 +56,8 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        version_table_schema="public",
+        include_object=_include_object,
     )
 
     with context.begin_transaction():
@@ -71,6 +77,8 @@ def run_migrations_online() -> None:
                 connection=connection,
                 target_metadata=target_metadata,
                 compare_type=True,
+                version_table_schema="public",
+                include_object=_include_object,
             )
 
             with context.begin_transaction():
