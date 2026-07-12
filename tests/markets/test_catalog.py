@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from freqtrade.markets import (
+    CapabilityName,
     CatalogStatus,
     MarketCatalog,
     MarketDefinition,
@@ -10,6 +11,7 @@ from freqtrade.markets import (
     ProductDefinition,
     ProductType,
     VenueDefinition,
+    default_catalog_snapshot,
 )
 
 
@@ -146,3 +148,49 @@ def test_market_scope_requires_products_and_is_immutable() -> None:
         MarketScope(market_id=MarketType.DIGITAL_ASSET, product_ids=())
     with pytest.raises(ValidationError):
         scope.venue_ids = ("bybit",)
+
+
+def test_default_catalog_declares_target_markets_without_claiming_live() -> None:
+    snapshot = default_catalog_snapshot()
+
+    assert snapshot.revision_id == "builtin-market-catalog-v1"
+    assert {market.market_id for market in snapshot.catalog.markets} == {
+        MarketType.DIGITAL_ASSET,
+        MarketType.A_SHARE,
+        MarketType.HK_STOCK,
+        MarketType.US_STOCK,
+    }
+    assert snapshot.capability(
+        MarketType.DIGITAL_ASSET,
+        ProductType.PERPETUAL,
+        CapabilityName.PAPER_TRADING,
+    ).allowed is True
+    live = snapshot.capability(
+        MarketType.DIGITAL_ASSET,
+        ProductType.PERPETUAL,
+        CapabilityName.LIVE_TRADING,
+    )
+    assert live.allowed is False
+    assert live.reason_code == "live_lane_not_enabled"
+
+
+def test_planned_product_capability_has_a_reason() -> None:
+    snapshot = default_catalog_snapshot()
+    decision = snapshot.capability(
+        MarketType.US_STOCK,
+        ProductType.OPTION,
+        CapabilityName.BACKTEST,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason_code == "market_adapter_not_installed"
+
+
+def test_cached_snapshot_capability_decisions_are_immutable() -> None:
+    snapshot = default_catalog_snapshot()
+    policy = snapshot.product_policies[0]
+
+    with pytest.raises(TypeError):
+        policy.decisions[CapabilityName.LIVE_TRADING] = policy.decision(
+            CapabilityName.LIVE_TRADING
+        )
