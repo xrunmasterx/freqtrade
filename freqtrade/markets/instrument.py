@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 
 class MarketType(StrEnum):
+    DIGITAL_ASSET = "digital_asset"
     CONTRACT = "contract"
     A_SHARE = "a_share"
     HK_STOCK = "hk_stock"
