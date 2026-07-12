@@ -23,7 +23,8 @@ class PlatformControlSecretError(RuntimeError):
 class PlatformControlSettings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    listen_host: Literal["127.0.0.1", "::1"] = "127.0.0.1"
+    bind_mode: Literal["host_loopback", "container_loopback_publish"] = "host_loopback"
+    listen_host: Literal["127.0.0.1", "::1", "0.0.0.0"] = "127.0.0.1"  # noqa: S104
     listen_port: int = Field(default=8090, ge=1, le=65535, strict=True)
     username: Identifier
     api_password_file: Path = Field(exclude=True, repr=False)
@@ -31,7 +32,16 @@ class PlatformControlSettings(BaseModel):
     database: PlatformDatabaseSettings = Field(exclude=True, repr=False)
 
     @model_validator(mode="after")
-    def validate_secret_paths(self) -> "PlatformControlSettings":
+    def validate_bind_mode_and_secret_paths(self) -> "PlatformControlSettings":
+        host_mode_mismatch = self.bind_mode == "host_loopback" and self.listen_host not in {
+            "127.0.0.1",
+            "::1",
+        }
+        container_mode_mismatch = (
+            self.bind_mode == "container_loopback_publish" and self.listen_host != "0.0.0.0"  # noqa: S104
+        )
+        if host_mode_mismatch or container_mode_mismatch:
+            raise ValueError("listen host does not match bind mode")
         paths = (
             self.api_password_file,
             self.jwt_secret_file,
@@ -55,6 +65,10 @@ class PlatformControlSettings(BaseModel):
     def from_env(cls) -> "PlatformControlSettings":
         try:
             values: dict[str, object] = {
+                "bind_mode": os.environ.get(
+                    "PLATFORM_CONTROL_BIND_MODE",
+                    "host_loopback",
+                ),
                 "listen_host": os.environ.get(
                     "PLATFORM_CONTROL_LISTEN_HOST",
                     "127.0.0.1",

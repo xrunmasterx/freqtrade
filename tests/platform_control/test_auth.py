@@ -82,6 +82,9 @@ def test_settings_from_env_uses_only_fixed_names_and_redacts_secret_paths(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.delenv("PLATFORM_CONTROL_BIND_MODE", raising=False)
+    monkeypatch.delenv("PLATFORM_CONTROL_LISTEN_HOST", raising=False)
+    monkeypatch.delenv("PLATFORM_CONTROL_LISTEN_PORT", raising=False)
     api_path = _write(tmp_path / "api-password", API_PASSWORD)
     jwt_path = _write(tmp_path / "jwt-secret", JWT_SECRET)
     database_path = _write(tmp_path / "database-password", "database-password")
@@ -103,11 +106,106 @@ def test_settings_from_env_uses_only_fixed_names_and_redacts_secret_paths(
 
     assert settings.listen_host == "127.0.0.1"
     assert settings.listen_port == 8090
+    assert settings.bind_mode == "host_loopback"
     assert settings.username == USERNAME
     assert settings.database.host == "database.internal"
     rendered = f"{settings!r} {settings.model_dump()}"
     for hidden in (str(api_path), str(jwt_path), str(database_path), API_PASSWORD, JWT_SECRET):
         assert hidden not in rendered
+
+
+@pytest.mark.parametrize(
+    ("bind_mode", "listen_host"),
+    [
+        ("host_loopback", "127.0.0.1"),
+        ("host_loopback", "::1"),
+        ("container_loopback_publish", "0.0.0.0"),
+    ],
+)
+def test_settings_accept_reviewed_bind_mode_host_pairs(
+    tmp_path: Path,
+    bind_mode: str,
+    listen_host: str,
+) -> None:
+    valid = _settings(tmp_path)
+
+    settings = PlatformControlSettings.from_values(
+        {
+            "bind_mode": bind_mode,
+            "listen_host": listen_host,
+            "listen_port": valid.listen_port,
+            "username": valid.username,
+            "api_password_file": valid.api_password_file,
+            "jwt_secret_file": valid.jwt_secret_file,
+            "database": valid.database,
+        }
+    )
+
+    assert settings.bind_mode == bind_mode
+    assert settings.listen_host == listen_host
+
+
+@pytest.mark.parametrize(
+    ("bind_mode", "listen_host"),
+    [
+        ("host_loopback", "0.0.0.0"),
+        ("container_loopback_publish", "127.0.0.1"),
+        ("container_loopback_publish", "::1"),
+        ("unknown_mode", "127.0.0.1"),
+    ],
+)
+def test_settings_reject_mismatched_or_unknown_bind_mode_without_echo(
+    tmp_path: Path,
+    bind_mode: str,
+    listen_host: str,
+) -> None:
+    valid = _settings(tmp_path)
+
+    with pytest.raises(PlatformControlSettingsError) as exc_info:
+        PlatformControlSettings.from_values(
+            {
+                "bind_mode": bind_mode,
+                "listen_host": listen_host,
+                "listen_port": valid.listen_port,
+                "username": valid.username,
+                "api_password_file": valid.api_password_file,
+                "jwt_secret_file": valid.jwt_secret_file,
+                "database": valid.database,
+            }
+        )
+
+    assert str(exc_info.value) == "invalid_platform_control_settings"
+    assert bind_mode not in str(exc_info.value)
+    assert listen_host not in str(exc_info.value)
+
+
+def test_settings_from_env_consumes_exact_container_bind_mode_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    api_path = _write(tmp_path / "api-password", API_PASSWORD)
+    jwt_path = _write(tmp_path / "jwt-secret", JWT_SECRET)
+    database_path = _write(tmp_path / "database-password", "database-password")
+    values = {
+        "PLATFORM_CONTROL_BIND_MODE": "container_loopback_publish",
+        "PLATFORM_CONTROL_LISTEN_HOST": "0.0.0.0",
+        "PLATFORM_CONTROL_USERNAME": USERNAME,
+        "PLATFORM_CONTROL_API_PASSWORD_FILE": str(api_path),
+        "PLATFORM_CONTROL_JWT_SECRET_FILE": str(jwt_path),
+        "PLATFORM_DATABASE_HOST": "database.internal",
+        "PLATFORM_DATABASE_PORT": "5432",
+        "PLATFORM_DATABASE_NAME": "platform_control",
+        "PLATFORM_DATABASE_USERNAME": "platform_control",
+        "PLATFORM_DATABASE_PASSWORD_FILE": str(database_path),
+        "PLATFORM_CONTROL_BIND_MODE_ALIAS": "host_loopback",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    settings = PlatformControlSettings.from_env()
+
+    assert settings.bind_mode == "container_loopback_publish"
+    assert settings.listen_host == "0.0.0.0"
 
 
 @pytest.mark.parametrize("listen_host", ["localhost", "0.0.0.0", "::", "192.168.1.5"])
