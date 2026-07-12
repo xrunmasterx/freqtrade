@@ -866,7 +866,7 @@ def test_postgres_claimer_skips_a_locked_oldest_job(
     first = postgres_repository.create_job(
         _command("start", "key-a", instance_id="instance-a"), "operator_cli"
     )
-    postgres_repository.create_job(
+    second = postgres_repository.create_job(
         _command("start", "key-b", instance_id="instance-b"), "operator_cli"
     )
 
@@ -879,4 +879,24 @@ def test_postgres_claimer_skips_a_locked_oldest_job(
         claimed = postgres_repository.claim_next_job("supervisor-b", lease_seconds=30)
 
     assert claimed is not None
-    assert claimed.job_id != first.job_id
+    assert claimed.job_id == second.job_id
+    with Session(postgres_engine) as persisted_session:
+        first_record = persisted_session.get(RuntimeLifecycleJobRecord, first.job_id)
+        claimed_record = persisted_session.get(RuntimeLifecycleJobRecord, claimed.job_id)
+        audits = persisted_session.scalars(select(RuntimeAuditEventRecord)).all()
+
+        assert first_record is not None
+        assert first_record.status == "pending"
+        assert first_record.lease_owner is None
+        assert first_record.lease_expires_at is None
+        assert claimed_record is not None
+        assert claimed_record.status == "claimed"
+        assert claimed_record.lease_owner == "supervisor-b"
+        assert claimed_record.lease_expires_at == NOW + timedelta(seconds=30)
+        assert len(audits) == 3
+        assert [audit.result_code for audit in audits].count("accepted") == 2
+        claim_audits = [audit for audit in audits if audit.result_code == "claimed"]
+        assert len(claim_audits) == 1
+        assert claim_audits[0].request_id == claimed.job_id
+        assert claim_audits[0].action == claimed.requested_action
+        assert claim_audits[0].result_code == "claimed"
