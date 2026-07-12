@@ -6,7 +6,14 @@ from pydantic import AwareDatetime, BaseModel, Field, RootModel, SerializeAsAny,
 from freqtrade.constants import DL_DATA_TIMEFRAMES, IntOrInf
 from freqtrade.enums import MarginMode, OrderTypeValues, SignalDirection, TradingMode
 from freqtrade.ft_types import AnnotationType, ValidExchangesType
-from freqtrade.markets import BotCapabilities, Instrument, MarketType
+from freqtrade.markets import (
+    BotCapabilities,
+    Instrument,
+    MarketCatalog,
+    MarketType,
+    ProductCapabilityPolicy,
+    ProductDefinition,
+)
 from freqtrade.research.side_data.models import ResearchSideLayerSelection
 from freqtrade.rpc.api_server.webserver_bgwork import JOB_CATEGORIES, ProgressTask
 
@@ -760,6 +767,17 @@ class ResearchBotResponse(BaseModel):
 
 class ResearchBotsResponse(BaseModel):
     bots: list[ResearchBotResponse]
+
+
+class CatalogResponse(BaseModel):
+    revision_id: str
+    catalog: MarketCatalog
+    product_policies: tuple[ProductCapabilityPolicy, ...]
+
+
+class CatalogProductsResponse(BaseModel):
+    market_id: MarketType
+    products: tuple[ProductDefinition, ...]
 
 
 class ResearchInstrumentResponse(Instrument):
