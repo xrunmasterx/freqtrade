@@ -3,9 +3,10 @@ from typing import Protocol
 
 from sqlalchemy import JSON, DateTime, Engine, String, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from freqtrade.markets import CatalogSnapshot
+from freqtrade.platform.database import PlatformBase
 
 
 class CatalogRepository(Protocol):
@@ -18,10 +19,6 @@ class StaticCatalogRepository:
 
     def current(self) -> CatalogSnapshot:
         return self._snapshot
-
-
-class PlatformBase(DeclarativeBase):
-    pass
 
 
 class CatalogRevisionRecord(PlatformBase):
@@ -38,12 +35,6 @@ class CatalogRevisionRecord(PlatformBase):
 class SqlCatalogRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
-
-    def initialize_schema(self) -> None:
-        PlatformBase.metadata.create_all(
-            self._engine,
-            tables=[CatalogRevisionRecord.__table__],
-        )
 
     def publish(self, snapshot: CatalogSnapshot, *, created_at: datetime) -> None:
         if created_at.tzinfo is None or created_at.utcoffset() is None:

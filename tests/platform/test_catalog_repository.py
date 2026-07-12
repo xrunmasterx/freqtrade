@@ -5,7 +5,7 @@ from typing import NoReturn
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, event, insert
+from sqlalchemy import Engine, create_engine, event, insert
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
@@ -13,7 +13,15 @@ from freqtrade.markets import CapabilityName, MarketType, ProductType, default_c
 from freqtrade.markets.default_catalog import CatalogSnapshot
 from freqtrade.platform import SqlCatalogRepository, StaticCatalogRepository
 from freqtrade.platform import catalog_repository as catalog_repository_module
-from freqtrade.platform.catalog_repository import CatalogRevisionRecord, PlatformBase
+from freqtrade.platform.catalog_repository import CatalogRevisionRecord
+from freqtrade.platform.database import PlatformBase
+
+
+def _create_catalog_schema(engine: Engine) -> None:
+    PlatformBase.metadata.create_all(
+        engine,
+        tables=[CatalogRevisionRecord.__table__],
+    )
 
 
 def test_static_catalog_repository_returns_the_exact_snapshot() -> None:
@@ -25,8 +33,8 @@ def test_static_catalog_repository_returns_the_exact_snapshot() -> None:
 
 def test_sql_catalog_repository_round_trips_an_immutable_revision() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
     snapshot = default_catalog_snapshot()
 
     repository.publish(snapshot, created_at=datetime(2026, 7, 12, tzinfo=UTC))
@@ -40,8 +48,8 @@ def test_sql_catalog_repository_uses_json_dump_and_model_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
     snapshot = default_catalog_snapshot()
     expected_payload = json.loads(snapshot.model_dump_json())
     dump_modes: list[str | None] = []
@@ -91,10 +99,7 @@ def test_sql_catalog_repository_rejects_invalid_stored_policy_payload(
     expected_message: str,
 ) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
-    PlatformBase.metadata.create_all(
-        engine,
-        tables=[CatalogRevisionRecord.__table__],
-    )
+    _create_catalog_schema(engine)
     payload = default_catalog_snapshot().model_dump(mode="json")
     policies = payload["product_policies"]
     if invalid_policy_form == "duplicate":
@@ -126,17 +131,21 @@ def test_sql_catalog_repository_rejects_invalid_stored_policy_payload(
 
 def test_sql_catalog_repository_requires_an_initialized_snapshot() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
 
     with pytest.raises(LookupError, match="market catalog is not initialized"):
         repository.current()
 
 
+def test_sql_catalog_repository_does_not_initialize_production_schema() -> None:
+    assert not hasattr(SqlCatalogRepository, "initialize_schema")
+
+
 def test_sql_catalog_repository_returns_the_latest_revision() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
     first = default_catalog_snapshot()
     second = first.model_copy(update={"revision_id": "builtin-market-catalog-v2"})
 
@@ -164,8 +173,8 @@ def test_sql_catalog_repository_rejects_naive_created_at_before_opening_session(
 
 def test_sql_catalog_repository_normalizes_offset_aware_times_before_ordering() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
     first = default_catalog_snapshot()
     second = first.model_copy(update={"revision_id": "builtin-market-catalog-v2"})
 
@@ -186,8 +195,8 @@ def test_sql_catalog_repository_translates_duplicate_revision_commit_race(
 ) -> None:
     database_path = (tmp_path / "catalog.db").as_posix()
     engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
     snapshot = default_catalog_snapshot()
     competitor_inserted = False
 
@@ -224,8 +233,8 @@ def test_sql_catalog_repository_translates_duplicate_revision_commit_race(
 
 def test_sql_catalog_repository_reraises_unrelated_integrity_error() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
-    repository.initialize_schema()
     snapshot = default_catalog_snapshot()
     forced_error = IntegrityError("forced INSERT failure", {}, RuntimeError("not a duplicate"))
 
