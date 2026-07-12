@@ -1,3 +1,4 @@
+import re
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
@@ -6,6 +7,9 @@ from pydantic import Field, field_serializer, field_validator, model_validator
 
 from freqtrade.markets.catalog import CatalogModel, ProductType
 from freqtrade.markets.instrument import MarketType
+
+
+_REASON_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class CapabilityName(StrEnum):
@@ -34,6 +38,11 @@ class CapabilityDecision(CatalogModel):
             raise ValueError("allowed capability cannot have a denial reason")
         if not self.allowed and not self.reason_code:
             raise ValueError("denied capability requires a reason code")
+        if (
+            self.reason_code is not None
+            and _REASON_CODE_PATTERN.fullmatch(self.reason_code) is None
+        ):
+            raise ValueError("reason code must match ^[a-z][a-z0-9_]*$")
         return self
 
     @classmethod

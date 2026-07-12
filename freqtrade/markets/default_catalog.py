@@ -1,5 +1,7 @@
 from functools import cache
 
+from pydantic import Field, model_validator
+
 from freqtrade.markets.capability_policy import (
     CapabilityDecision,
     CapabilityName,
@@ -18,9 +20,24 @@ from freqtrade.markets.instrument import MarketType
 
 
 class CatalogSnapshot(CatalogModel):
-    revision_id: str
+    revision_id: str = Field(min_length=1, max_length=128)
     catalog: MarketCatalog
     product_policies: tuple[ProductCapabilityPolicy, ...]
+
+    @model_validator(mode="after")
+    def validate_product_policies(self) -> "CatalogSnapshot":
+        policy_keys = [(policy.market_id, policy.product_id) for policy in self.product_policies]
+        policy_key_set = set(policy_keys)
+        if len(policy_keys) != len(policy_key_set):
+            raise ValueError("duplicate product capability policy")
+        known_products = {
+            (product.market_id, product.product_id) for product in self.catalog.products
+        }
+        if any(policy_key not in known_products for policy_key in policy_keys):
+            raise ValueError("policy references unknown product")
+        if known_products != policy_key_set:
+            raise ValueError("product is missing capability policy")
+        return self
 
     def capability(
         self,
@@ -180,17 +197,11 @@ def _policies() -> tuple[ProductCapabilityPolicy, ...]:
                 )
             )
         elif market_id == MarketType.DIGITAL_ASSET and product_id == ProductType.OPTION:
-            policies.append(
-                _deny_all(market_id, product_id, "options_adapter_not_installed")
-            )
+            policies.append(_deny_all(market_id, product_id, "options_adapter_not_installed"))
         elif market_id in {MarketType.HK_STOCK, MarketType.US_STOCK}:
-            policies.append(
-                _deny_all(market_id, product_id, "market_adapter_not_installed")
-            )
+            policies.append(_deny_all(market_id, product_id, "market_adapter_not_installed"))
         else:
-            policies.append(
-                _deny_all(market_id, product_id, "product_adapter_not_installed")
-            )
+            policies.append(_deny_all(market_id, product_id, "product_adapter_not_installed"))
     return tuple(policies)
 
 

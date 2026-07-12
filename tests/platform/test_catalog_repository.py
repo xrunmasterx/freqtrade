@@ -13,7 +13,7 @@ from freqtrade.markets import CapabilityName, MarketType, ProductType, default_c
 from freqtrade.markets.default_catalog import CatalogSnapshot
 from freqtrade.platform import SqlCatalogRepository, StaticCatalogRepository
 from freqtrade.platform import catalog_repository as catalog_repository_module
-from freqtrade.platform.catalog_repository import CatalogRevisionRecord
+from freqtrade.platform.catalog_repository import CatalogRevisionRecord, PlatformBase
 
 
 def test_static_catalog_repository_returns_the_exact_snapshot() -> None:
@@ -76,6 +76,52 @@ def test_sql_catalog_repository_uses_json_dump_and_model_validation(
         policy.decisions[CapabilityName.MARKET_DATA] = decision
     with pytest.raises(ValidationError, match="Instance is frozen"):
         decision.allowed = False
+
+
+@pytest.mark.parametrize(
+    ("invalid_policy_form", "expected_message"),
+    [
+        ("duplicate", "duplicate product capability policy"),
+        ("dangling", "policy references unknown product"),
+        ("missing", "product is missing capability policy"),
+    ],
+)
+def test_sql_catalog_repository_rejects_invalid_stored_policy_payload(
+    invalid_policy_form: str,
+    expected_message: str,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    PlatformBase.metadata.create_all(
+        engine,
+        tables=[CatalogRevisionRecord.__table__],
+    )
+    payload = default_catalog_snapshot().model_dump(mode="json")
+    policies = payload["product_policies"]
+    if invalid_policy_form == "duplicate":
+        policies.append(policies[0])
+    elif invalid_policy_form == "dangling":
+        policies.append(
+            {
+                "market_id": "a_share",
+                "product_id": "warrant",
+                "decisions": {},
+            }
+        )
+    else:
+        policies.pop()
+    with engine.begin() as connection:
+        connection.execute(
+            insert(CatalogRevisionRecord).values(
+                revision_id=f"invalid-{invalid_policy_form}",
+                payload=payload,
+                created_at=datetime(2026, 7, 12, tzinfo=UTC),
+            )
+        )
+
+    repository = SqlCatalogRepository(engine)
+
+    with pytest.raises(ValidationError, match=expected_message):
+        repository.current()
 
 
 def test_sql_catalog_repository_requires_an_initialized_snapshot() -> None:
