@@ -21,6 +21,7 @@ from freqtrade.platform.runtime_models import (
 from freqtrade.platform.runtime_repository import (
     RuntimeAuditEvent,
     RuntimeConflict,
+    RuntimeDataError,
     RuntimeInstanceAuditState,
     RuntimeInvalidTransition,
     RuntimeNotFound,
@@ -180,6 +181,7 @@ def test_repository_contracts_are_public_protocols(repository: SqlRuntimeReposit
     for public_name in (
         "RuntimeAuditEvent",
         "RuntimeConflict",
+        "RuntimeDataError",
         "RuntimeInstanceAuditState",
         "RuntimeInvalidTransition",
         "RuntimeNotFound",
@@ -451,6 +453,53 @@ def test_read_views_are_ordered_and_unknown_instances_fail(
     ):
         with pytest.raises(RuntimeNotFound, match=r"^runtime_instance_not_found$"):
             operation()
+
+
+def test_list_attempts_maps_health_evidence_to_result_code_only(
+    repository: SqlRuntimeRepository,
+    engine: Engine,
+) -> None:
+    _seed_instance(engine)
+    _seed_attempt(
+        engine,
+        status="stopped",
+        health_result={
+            "result_code": "healthy",
+            "checks": [{"name": "runtime_http", "status": "passed"}],
+        },
+    )
+
+    attempt = repository.list_attempts("instance-1")[0]
+
+    assert attempt.health_result == "healthy"
+    assert "checks" not in attempt.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "health_result",
+    [
+        {"checks": ["private_missing_result"]},
+        {"result_code": {"private": "non_string_result"}},
+        {"result_code": "INVALID private result"},
+    ],
+    ids=["missing", "non-string", "invalid-identifier"],
+)
+def test_list_attempts_rejects_invalid_health_evidence_with_stable_code(
+    repository: SqlRuntimeRepository,
+    engine: Engine,
+    health_result: dict[str, object],
+) -> None:
+    _seed_instance(engine)
+    _seed_attempt(engine, status="stopped", health_result=health_result)
+
+    with pytest.raises(RuntimeDataError) as exc_info:
+        repository.list_attempts("instance-1")
+
+    assert str(exc_info.value) == "invalid_health_result"
+    assert not any(
+        marker in str(exc_info.value)
+        for marker in ("private_missing_result", "non_string_result", "INVALID private result")
+    )
 
 
 def test_claim_orders_jobs_and_validates_lease_bounds(

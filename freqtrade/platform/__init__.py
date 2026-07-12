@@ -26,6 +26,7 @@ from freqtrade.platform.runtime_domain import (
 from freqtrade.platform.runtime_repository import (
     RuntimeAuditEvent,
     RuntimeConflict,
+    RuntimeDataError,
     RuntimeInstanceAuditState,
     RuntimeInvalidTransition,
     RuntimeNotFound,
@@ -46,6 +47,7 @@ __all__ = [
     "RuntimeAttemptStatus",
     "RuntimeAttemptView",
     "RuntimeConflict",
+    "RuntimeDataError",
     "RuntimeDesiredState",
     "RuntimeInstanceView",
     "RuntimeInstanceAuditState",

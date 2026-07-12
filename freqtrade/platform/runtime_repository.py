@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
@@ -51,6 +51,10 @@ class RuntimeNotFound(RuntimeError):
 
 
 class RuntimeConflict(RuntimeError):
+    pass
+
+
+class RuntimeDataError(RuntimeError):
     pass
 
 
@@ -134,6 +138,20 @@ def _aware_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _health_result_summary(evidence: object) -> str | None:
+    if evidence is None:
+        return None
+    if not isinstance(evidence, dict):
+        raise RuntimeDataError("invalid_health_result")
+    result_code = evidence.get("result_code")
+    if not isinstance(result_code, str):
+        raise RuntimeDataError("invalid_health_result")
+    try:
+        return _IDENTIFIER_ADAPTER.validate_python(result_code)
+    except ValidationError:
+        raise RuntimeDataError("invalid_health_result") from None
 
 
 class SqlRuntimeRepository:
@@ -585,7 +603,7 @@ class SqlRuntimeRepository:
             runtime_spec_revision_id=record.runtime_spec_revision_id,
             adapter_template_revision_id=record.adapter_template_revision_id,
             status=RuntimeAttemptStatus(record.status),
-            health_result=record.health_result,
+            health_result=_health_result_summary(record.health_result),
             started_at=_aware_utc(record.started_at),
             stopped_at=_aware_utc(record.stopped_at),
             exit_code=record.exit_code,
