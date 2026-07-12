@@ -18,14 +18,13 @@ depends_on: str | Sequence[str] | None = None
 
 
 def _create_catalog_table() -> None:
-    if sa.inspect(op.get_bind()).has_table("platform_catalog_revisions"):
-        return
     op.create_table(
         "platform_catalog_revisions",
         sa.Column("revision_id", sa.String(length=128), nullable=False),
         sa.Column("payload", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("revision_id"),
+        if_not_exists=True,
     )
 
 

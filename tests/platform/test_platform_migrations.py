@@ -1,9 +1,15 @@
+import contextlib
+import io
 import os
 import re
+import runpy
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import alembic
 import pytest
+import sqlalchemy
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import (
@@ -28,6 +34,7 @@ BACKEND_ROOT = Path(__file__).parents[2]
 ALEMBIC_CONFIG_PATH = BACKEND_ROOT / "alembic-platform.ini"
 MIGRATIONS_ROOT = BACKEND_ROOT / "platform_migrations"
 TEST_DATABASE_PATTERN = re.compile(r"^platform_test[a-z0-9_]*$")
+TEST_DATABASE_OVERRIDE_QUERY_KEYS = {"database", "dbname"}
 POSTGRES_SKIP_REASON = "PLATFORM_TEST_POSTGRES_URL is required for PostgreSQL migrations"
 
 EXPECTED_COLUMNS = {
@@ -320,16 +327,41 @@ EXPECTED_PARTIAL_INDEX_STATES = {
 }
 
 
+class _RedactedPostgresUrl(str):
+    def __repr__(self) -> str:
+        return "'<redacted platform test PostgreSQL URL>'"
+
+
 def _alembic_config(postgres_url: str) -> Config:
     config = Config(str(ALEMBIC_CONFIG_PATH))
     config.set_main_option("sqlalchemy.url", postgres_url.replace("%", "%%"))
     return config
 
 
+def _validate_test_database_url(postgres_url: str) -> None:
+    parsed_url = make_url(postgres_url)
+    query_keys = {key.casefold() for key in parsed_url.query}
+    database_name = parsed_url.database or ""
+    if (
+        parsed_url.get_backend_name() != "postgresql"
+        or TEST_DATABASE_PATTERN.fullmatch(database_name) is None
+        or query_keys & TEST_DATABASE_OVERRIDE_QUERY_KEYS
+    ):
+        raise RuntimeError("refusing an unsafe platform test database URL")
+
+
+def _require_effective_test_database(database_name: str) -> None:
+    if TEST_DATABASE_PATTERN.fullmatch(database_name) is None:
+        raise RuntimeError("refusing to reset a non-test platform database")
+
+
 def _reset_public_schema(postgres_url: str) -> None:
+    _validate_test_database_url(postgres_url)
     engine = create_engine(postgres_url)
     try:
         with engine.begin() as connection:
+            database_name = connection.exec_driver_sql("SELECT current_database()").scalar_one()
+            _require_effective_test_database(database_name)
             connection.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
             connection.exec_driver_sql("CREATE SCHEMA public")
     finally:
@@ -341,18 +373,14 @@ def postgres_url() -> str:
     raw_url = os.environ.get("PLATFORM_TEST_POSTGRES_URL")
     if raw_url is None:
         pytest.skip(POSTGRES_SKIP_REASON)
-    parsed_url = make_url(raw_url)
-    if parsed_url.get_backend_name() != "postgresql":
-        raise RuntimeError("PostgreSQL is required for platform migration tests")
-    database_name = parsed_url.database or ""
-    if TEST_DATABASE_PATTERN.fullmatch(database_name) is None:
-        raise RuntimeError("refusing to reset a non-test platform database")
+    _validate_test_database_url(raw_url)
+    test_url = _RedactedPostgresUrl(raw_url)
 
-    _reset_public_schema(raw_url)
+    _reset_public_schema(test_url)
     try:
-        yield raw_url
+        yield test_url
     finally:
-        _reset_public_schema(raw_url)
+        _reset_public_schema(test_url)
 
 
 def _load_tables(postgres_url: str) -> tuple[Engine, dict[str, Table]]:
@@ -450,6 +478,198 @@ def _expect_integrity_error(engine: Engine, table: Table, values: dict[str, obje
             connection.execute(insert(table).values(**values))
 
 
+def test_test_database_url_repr_redacts_secret() -> None:
+    raw_url = "postgresql+psycopg://platform_test:sensitive@127.0.0.1/platform_test_safe"
+
+    test_url = _RedactedPostgresUrl(raw_url)
+
+    assert str(test_url) == raw_url
+    assert "sensitive" not in repr(test_url)
+    assert raw_url not in repr(test_url)
+
+
+def test_test_database_guard_rejects_dbname_override_without_secret_in_error() -> None:
+    password = "guard-regression-password"
+    unsafe_url = (
+        f"postgresql+psycopg://platform_test:{password}@127.0.0.1/"
+        "platform_test_safe?dbname=production"
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _validate_test_database_url(unsafe_url)
+
+    assert unsafe_url not in str(exc_info.value)
+    assert password not in str(exc_info.value)
+
+
+def test_reset_rejects_dbname_override_before_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection_attempted = False
+
+    def fail_if_connection_is_attempted(_url: str) -> Engine:
+        nonlocal connection_attempted
+        connection_attempted = True
+        raise AssertionError("database connection attempted before URL validation")
+
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", fail_if_connection_is_attempted)
+
+    with pytest.raises(RuntimeError):
+        _reset_public_schema(
+            "postgresql+psycopg://platform_test@127.0.0.1/platform_test_safe?dbname=production"
+        )
+
+    assert connection_attempted is False
+
+
+def test_reset_verifies_effective_database_before_schema_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements = []
+
+    class FakeResult:
+        def scalar_one(self) -> str:
+            return "production"
+
+    class FakeConnection:
+        def exec_driver_sql(self, statement: str) -> FakeResult:
+            statements.append(statement)
+            if statement == "SELECT current_database()":
+                return FakeResult()
+            raise AssertionError("schema DDL executed before effective database validation")
+
+    class FakeEngine:
+        @contextlib.contextmanager
+        def begin(self):
+            yield FakeConnection()
+
+        def dispose(self) -> None:
+            pass
+
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", lambda _url: FakeEngine())
+
+    with pytest.raises(RuntimeError, match="refusing to reset a non-test platform database"):
+        _reset_public_schema("postgresql+psycopg://platform_test@127.0.0.1/platform_test_safe")
+
+    assert statements == ["SELECT current_database()"]
+
+
+def test_migration_test_fallback_rejects_dbname_override_before_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "migration-guard-password"
+    unsafe_url = (
+        f"postgresql+psycopg://platform_test:{password}@127.0.0.1/"
+        "platform_test_safe?dbname=production"
+    )
+    connection_attempted = False
+
+    def fail_if_connection_is_attempted(*_args: object, **_kwargs: object) -> Engine:
+        nonlocal connection_attempted
+        connection_attempted = True
+        raise AssertionError("database connection attempted before URL validation")
+
+    monkeypatch.setenv("PLATFORM_TEST_POSTGRES_URL", unsafe_url)
+    monkeypatch.setattr(sqlalchemy, "create_engine", fail_if_connection_is_attempted)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        command.current(Config(str(ALEMBIC_CONFIG_PATH)))
+
+    assert connection_attempted is False
+    assert unsafe_url not in str(exc_info.value)
+    assert password not in str(exc_info.value)
+
+
+def test_migration_test_fallback_verifies_effective_database_before_migrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+
+    class FakeResult:
+        def scalar_one(self) -> str:
+            return "production"
+
+    class FakeConnection:
+        def __enter__(self):
+            events.append("connect")
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def exec_driver_sql(self, statement: str) -> FakeResult:
+            events.append(statement)
+            return FakeResult()
+
+    class FakeEngine:
+        def connect(self) -> FakeConnection:
+            return FakeConnection()
+
+        def dispose(self) -> None:
+            events.append("dispose")
+
+    class FakeConfig:
+        def get_main_option(self, _name: str) -> None:
+            return None
+
+    class FakeContext:
+        config = FakeConfig()
+
+        def is_offline_mode(self) -> bool:
+            return False
+
+        def configure(self, **_kwargs: object) -> None:
+            events.append("configure")
+
+        @contextlib.contextmanager
+        def begin_transaction(self):
+            yield
+
+        def run_migrations(self) -> None:
+            events.append("run_migrations")
+
+    monkeypatch.setenv(
+        "PLATFORM_TEST_POSTGRES_URL",
+        "postgresql+psycopg://platform_test@127.0.0.1/platform_test_safe",
+    )
+    monkeypatch.setattr(alembic, "context", FakeContext())
+    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *_args, **_kwargs: FakeEngine())
+
+    with pytest.raises(RuntimeError, match="isolated test PostgreSQL database"):
+        runpy.run_path(str(MIGRATIONS_ROOT / "env.py"))
+
+    assert events == ["connect", "SELECT current_database()", "dispose"]
+
+
+def test_offline_upgrade_emits_complete_registry_sql_without_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = io.StringIO()
+    config = Config(str(ALEMBIC_CONFIG_PATH), output_buffer=output)
+    config.set_main_option(
+        "sqlalchemy.url",
+        "postgresql+psycopg://offline.invalid/platform_test_offline",
+    )
+    connection_attempted = False
+
+    def fail_if_connection_is_attempted(*_args: object, **_kwargs: object) -> Engine:
+        nonlocal connection_attempted
+        connection_attempted = True
+        raise AssertionError("offline migration attempted a database connection")
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", fail_if_connection_is_attempted)
+
+    command.upgrade(config, "head", sql=True)
+
+    sql = output.getvalue()
+    assert connection_attempted is False
+    for table_name in EXPECTED_TABLES:
+        assert re.search(rf"CREATE TABLE(?: IF NOT EXISTS)? {table_name}\b", sql)
+    assert "offline.invalid" not in sql
+    assert "postgresql+psycopg" not in sql
+    assert "password" not in sql.lower()
+
+
 def test_alembic_configuration_contains_no_dsn_or_credentials() -> None:
     contents = ALEMBIC_CONFIG_PATH.read_text(encoding="utf-8")
 
@@ -492,6 +712,22 @@ def test_empty_postgres_upgrades_to_registry_head(postgres_url: str) -> None:
     engine = create_engine(postgres_url)
     try:
         assert EXPECTED_TABLES <= set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+
+
+def test_test_url_fallback_upgrade_commits_registry_head(postgres_url: str) -> None:
+    command.upgrade(Config(str(ALEMBIC_CONFIG_PATH)), "head")
+
+    engine = create_engine(postgres_url)
+    try:
+        schema = inspect(engine)
+        assert EXPECTED_TABLES <= set(schema.get_table_names())
+        with engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+                == "20260712_0001"
+            )
     finally:
         engine.dispose()
 
