@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -194,3 +196,34 @@ def test_cached_snapshot_capability_decisions_are_immutable() -> None:
         policy.decisions[CapabilityName.LIVE_TRADING] = policy.decision(
             CapabilityName.LIVE_TRADING
         )
+
+
+def test_cached_snapshot_capability_decisions_are_json_serializable() -> None:
+    snapshot = default_catalog_snapshot()
+    spot_policy_index = next(
+        index
+        for index, policy in enumerate(snapshot.product_policies)
+        if policy.market_id == MarketType.DIGITAL_ASSET
+        and policy.product_id == ProductType.SPOT
+    )
+    expected_decisions = {
+        "market_data": {"allowed": True, "reason_code": None},
+        "research": {"allowed": True, "reason_code": None},
+        "backtest": {"allowed": True, "reason_code": None},
+        "simulation": {"allowed": True, "reason_code": None},
+        "paper_trading": {"allowed": True, "reason_code": None},
+        "live_trading": {
+            "allowed": False,
+            "reason_code": "live_lane_not_enabled",
+        },
+    }
+
+    dumped_decisions = snapshot.model_dump(mode="json")["product_policies"][
+        spot_policy_index
+    ]["decisions"]
+    json_decisions = json.loads(snapshot.model_dump_json())["product_policies"][
+        spot_policy_index
+    ]["decisions"]
+
+    assert dumped_decisions == expected_decisions
+    assert json_decisions == expected_decisions

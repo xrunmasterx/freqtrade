@@ -2,7 +2,7 @@ from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 
 from freqtrade.markets.catalog import CatalogModel, ProductType
 from freqtrade.markets.instrument import MarketType
@@ -57,6 +57,13 @@ class ProductCapabilityPolicy(CatalogModel):
         decisions: Mapping[CapabilityName, CapabilityDecision],
     ) -> Mapping[CapabilityName, CapabilityDecision]:
         return MappingProxyType(dict(decisions))
+
+    @field_serializer("decisions")
+    def serialize_decisions(
+        self,
+        decisions: Mapping[CapabilityName, CapabilityDecision],
+    ) -> dict[CapabilityName, CapabilityDecision]:
+        return dict(decisions)
 
     def decision(self, capability: CapabilityName) -> CapabilityDecision:
         return self.decisions.get(
