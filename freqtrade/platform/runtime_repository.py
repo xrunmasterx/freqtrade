@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -44,6 +44,7 @@ _ACTIVE_ATTEMPT_STATUSES = (
 _ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
 _LEASED_JOB_STATUSES = ("claimed", "running")
 _AUDIT_SOURCE = "runtime_repository"
+_ViewT = TypeVar("_ViewT")
 
 
 class RuntimeNotFound(RuntimeError):
@@ -152,6 +153,13 @@ def _health_result_summary(evidence: object) -> str | None:
         return _IDENTIFIER_ADAPTER.validate_python(result_code)
     except ValidationError:
         raise RuntimeDataError("invalid_health_result") from None
+
+
+def _registry_view(factory: Callable[[], _ViewT]) -> _ViewT:
+    try:
+        return factory()
+    except (ValueError, ValidationError):
+        raise RuntimeDataError("invalid_registry_data") from None
 
 
 class SqlRuntimeRepository:
@@ -574,55 +582,61 @@ class SqlRuntimeRepository:
 
     @staticmethod
     def _instance_view(record: RuntimeInstanceRecord) -> RuntimeInstanceView:
-        return RuntimeInstanceView(
-            instance_id=record.instance_id,
-            instance_kind=record.instance_kind,
-            owner_ref=RuntimeOwnerRef(
-                owner_kind=record.owner_kind,
-                owner_id=record.owner_id,
-                owner_revision=record.owner_revision,
-            ),
-            management_mode=RuntimeManagementMode(record.management_mode),
-            runtime_spec_revision_id=record.runtime_spec_revision_id,
-            environment=record.environment,
-            state_allocation_id=record.state_allocation_id,
-            desired_state=record.desired_state,
-            lifecycle_status=record.lifecycle_status,
-            failure_latched=record.failure_latched,
-            optimistic_version=record.optimistic_version,
-            created_at=_aware_utc(record.created_at),
-            retired_at=_aware_utc(record.retired_at),
+        return _registry_view(
+            lambda: RuntimeInstanceView(
+                instance_id=record.instance_id,
+                instance_kind=record.instance_kind,
+                owner_ref=RuntimeOwnerRef(
+                    owner_kind=record.owner_kind,
+                    owner_id=record.owner_id,
+                    owner_revision=record.owner_revision,
+                ),
+                management_mode=RuntimeManagementMode(record.management_mode),
+                runtime_spec_revision_id=record.runtime_spec_revision_id,
+                environment=record.environment,
+                state_allocation_id=record.state_allocation_id,
+                desired_state=record.desired_state,
+                lifecycle_status=record.lifecycle_status,
+                failure_latched=record.failure_latched,
+                optimistic_version=record.optimistic_version,
+                created_at=_aware_utc(record.created_at),
+                retired_at=_aware_utc(record.retired_at),
+            )
         )
 
     @staticmethod
     def _attempt_view(record: RuntimeAttemptRecord) -> RuntimeAttemptView:
-        return RuntimeAttemptView(
-            attempt_id=record.attempt_id,
-            instance_id=record.instance_id,
-            attempt_number=record.attempt_number,
-            runtime_spec_revision_id=record.runtime_spec_revision_id,
-            adapter_template_revision_id=record.adapter_template_revision_id,
-            status=RuntimeAttemptStatus(record.status),
-            health_result=_health_result_summary(record.health_result),
-            started_at=_aware_utc(record.started_at),
-            stopped_at=_aware_utc(record.stopped_at),
-            exit_code=record.exit_code,
-            failure_code=record.failure_code,
+        return _registry_view(
+            lambda: RuntimeAttemptView(
+                attempt_id=record.attempt_id,
+                instance_id=record.instance_id,
+                attempt_number=record.attempt_number,
+                runtime_spec_revision_id=record.runtime_spec_revision_id,
+                adapter_template_revision_id=record.adapter_template_revision_id,
+                status=RuntimeAttemptStatus(record.status),
+                health_result=_health_result_summary(record.health_result),
+                started_at=_aware_utc(record.started_at),
+                stopped_at=_aware_utc(record.stopped_at),
+                exit_code=record.exit_code,
+                failure_code=record.failure_code,
+            )
         )
 
     @staticmethod
     def _job_view(record: RuntimeLifecycleJobRecord) -> RuntimeJobView:
-        return RuntimeJobView(
-            job_id=record.job_id,
-            instance_id=record.instance_id,
-            requested_action=record.requested_action,
-            idempotency_key=record.idempotency_key,
-            expected_instance_version=record.expected_instance_version,
-            status=RuntimeJobStatus(record.status),
-            lease_owner=record.lease_owner,
-            lease_expires_at=_aware_utc(record.lease_expires_at),
-            requested_at=_aware_utc(record.requested_at),
-            started_at=_aware_utc(record.started_at),
-            completed_at=_aware_utc(record.completed_at),
-            failure_code=record.failure_code,
+        return _registry_view(
+            lambda: RuntimeJobView(
+                job_id=record.job_id,
+                instance_id=record.instance_id,
+                requested_action=record.requested_action,
+                idempotency_key=record.idempotency_key,
+                expected_instance_version=record.expected_instance_version,
+                status=RuntimeJobStatus(record.status),
+                lease_owner=record.lease_owner,
+                lease_expires_at=_aware_utc(record.lease_expires_at),
+                requested_at=_aware_utc(record.requested_at),
+                started_at=_aware_utc(record.started_at),
+                completed_at=_aware_utc(record.completed_at),
+                failure_code=record.failure_code,
+            )
         )

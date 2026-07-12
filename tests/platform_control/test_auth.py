@@ -484,7 +484,8 @@ def test_auth_rejects_wrong_identity_algorithm_expiry_signature_basic_and_query(
         "/api/v2/runtime-instances",
         params={"username": USERNAME, "password": API_PASSWORD, "token": tokens[0]},
     )
-    assert query.status_code == 401
+    assert query.status_code == 400
+    assert query.json() == {"detail": "unexpected_query_parameters"}
     assert API_PASSWORD not in query.text
 
 

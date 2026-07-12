@@ -624,6 +624,10 @@ def test_offline_upgrade_emits_complete_registry_sql_without_connection(
     assert connection_attempted is False
     for table_name in EXPECTED_TABLES:
         assert re.search(rf"CREATE TABLE(?: IF NOT EXISTS)? {table_name}\b", sql)
+    assert "incompatible_platform_catalog_revisions" in sql
+    assert sql.index("incompatible_platform_catalog_revisions") < sql.index(
+        "CREATE TABLE runtime_instances"
+    )
     assert "offline.invalid" not in sql
     assert "postgresql+psycopg" not in sql
     assert "password" not in sql.lower()
@@ -735,6 +739,107 @@ def test_upgrade_preserves_non_empty_catalog(postgres_url: str) -> None:
             row = connection.execute(catalog.select()).one()
         assert row.revision_id == "catalog-revision-1"
         assert row.payload == {"schema_version": 1}
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "catalog_ddl",
+    [
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload json NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload json NOT NULL, "
+            "created_at timestamptz NOT NULL, extra text)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(127) PRIMARY KEY, payload json NOT NULL, "
+            "created_at timestamptz NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload jsonb NOT NULL, "
+            "created_at timestamptz NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload json, "
+            "created_at timestamptz NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) NOT NULL, payload json NOT NULL, "
+            "created_at timestamptz NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) NOT NULL, payload json NOT NULL, "
+            "created_at timestamptz PRIMARY KEY)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload json NOT NULL, "
+            "created_at timestamptz NOT NULL, CONSTRAINT unexpected_catalog_check "
+            "CHECK (revision_id <> 'forbidden'))"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload json NOT NULL, "
+            "created_at timestamptz NOT NULL DEFAULT now())"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) GENERATED ALWAYS AS ('generated') STORED "
+            "PRIMARY KEY, payload json NOT NULL, created_at timestamptz NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+            "payload json NOT NULL, created_at timestamptz NOT NULL)"
+        ),
+        (
+            "CREATE TABLE platform_catalog_revisions ("
+            "revision_id varchar(128) PRIMARY KEY, payload json NOT NULL, "
+            "created_at timestamptz NOT NULL); CREATE INDEX unexpected_catalog_index "
+            "ON platform_catalog_revisions (created_at)"
+        ),
+    ],
+    ids=[
+        "missing-column",
+        "extra-column",
+        "wrong-length",
+        "wrong-type",
+        "wrong-nullability",
+        "missing-primary-key",
+        "wrong-primary-key",
+        "extra-constraint",
+        "default",
+        "generated",
+        "identity",
+        "extra-index",
+    ],
+)
+def test_upgrade_rejects_incompatible_catalog_before_registry_ddl_or_stamp(
+    postgres_url: str,
+    catalog_ddl: str,
+) -> None:
+    engine = create_engine(postgres_url)
+    try:
+        with engine.begin() as connection:
+            for statement in catalog_ddl.split("; "):
+                connection.exec_driver_sql(statement)
+
+        with pytest.raises(sqlalchemy.exc.DBAPIError) as exc_info:
+            command.upgrade(_alembic_config(postgres_url), "head")
+
+        message = str(exc_info.value)
+        assert "incompatible_platform_catalog_revisions" in message
+        assert "password" not in message.lower()
+        assert set(inspect(engine).get_table_names()) == {"platform_catalog_revisions"}
     finally:
         engine.dispose()
 

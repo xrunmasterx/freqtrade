@@ -11,7 +11,12 @@ def main() -> None:
     engine = create_platform_engine(settings.database)
     repository = SqlPlatformControlQueryRepository(engine)
     app = create_platform_app(settings, repository)
-    uvicorn.run(app, host=settings.listen_host, port=settings.listen_port)
+    uvicorn.run(
+        app,
+        host=settings.listen_host,
+        port=settings.listen_port,
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

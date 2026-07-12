@@ -1,8 +1,10 @@
 import importlib
 import inspect
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import uvicorn
@@ -242,6 +244,73 @@ def test_ping_is_public_and_all_other_reads_share_auth(
         assert client.get(path, headers=auth_headers).status_code == 200
 
 
+@pytest.mark.parametrize("method", ["get", "head"])
+@pytest.mark.parametrize(
+    "path,authenticated",
+    [
+        ("/api/v2/ping", False),
+        ("/api/v2/catalog", False),
+        ("/api/v2/catalog", True),
+        ("/api/v2/runtime-instances", False),
+        ("/api/v2/runtime-instances", True),
+        ("/api/v2/runtime-instances/instance-1", False),
+        ("/api/v2/runtime-instances/instance-1", True),
+        ("/api/v2/runtime-instances/instance-1/attempts", False),
+        ("/api/v2/runtime-instances/instance-1/attempts", True),
+        ("/api/v2/runtime-instances/instance-1/jobs", False),
+        ("/api/v2/runtime-instances/instance-1/jobs", True),
+    ],
+)
+def test_nonempty_query_is_rejected_before_auth_and_repository_without_logging_values(
+    client: TestClient,
+    repository: FakeQueryRepository,
+    auth_headers: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    path: str,
+    authenticated: bool,
+) -> None:
+    sentinel = "phase2a-sensitive-query-sentinel"
+    before = list(repository.calls)
+    caplog.set_level(logging.INFO, logger="freqtrade.platform_control")
+
+    response = getattr(client, method)(
+        f"{path}?private_key={sentinel}",
+        headers=auth_headers if authenticated else None,
+    )
+
+    assert response.status_code == 400
+    if method == "head":
+        assert response.content == b""
+        assert response.headers["content-type"] == "application/json"
+    else:
+        assert response.json() == {"detail": "unexpected_query_parameters"}
+    assert repository.calls == before
+    application_logs = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith(("freqtrade.platform_control", "uvicorn"))
+    )
+    assert sentinel not in application_logs
+    assert "private_key" not in application_logs
+
+
+def test_token_routes_reject_nonempty_query_before_auth_processing(
+    client: TestClient,
+) -> None:
+    sentinel = "phase2a-sensitive-token-query"
+    login = client.post(
+        f"/api/v2/token/login?private_key={sentinel}",
+        auth=(USERNAME, API_PASSWORD),
+    )
+    refresh = client.post(f"/api/v2/token/refresh?private_key={sentinel}")
+
+    for response in (login, refresh):
+        assert response.status_code == 400
+        assert response.json() == {"detail": "unexpected_query_parameters"}
+        assert sentinel not in response.text
+
+
 def test_read_shapes_use_sql_catalog_and_exact_runtime_wrappers(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -314,21 +383,6 @@ def test_stable_registry_catalog_and_control_plane_errors_hide_exception_text(
     assert invalid.json() == {"detail": "invalid_registry_data"}
     assert "private evidence" not in invalid.text
 
-    from pydantic import ValidationError
-
-    def invalid_registry_validation():
-        try:
-            RuntimeInstanceView.model_validate({"instance_id": "private invalid registry"})
-        except ValidationError as error:
-            raise error
-        raise AssertionError("invalid registry fixture unexpectedly validated")
-
-    monkeypatch.setattr(repository, "list_instances", invalid_registry_validation)
-    invalid_validation = client.get("/api/v2/runtime-instances", headers=auth_headers)
-    assert invalid_validation.status_code == 500
-    assert invalid_validation.json() == {"detail": "invalid_registry_data"}
-    assert "private invalid registry" not in invalid_validation.text
-
     def unavailable_catalog():
         raise LookupError("private catalog state")
 
@@ -355,6 +409,39 @@ def test_stable_registry_catalog_and_control_plane_errors_hide_exception_text(
     assert control.status_code == 503
     assert control.json() == {"detail": "control_plane_unavailable"}
     assert "private" not in control.text
+
+
+@pytest.mark.parametrize(
+    "operation,path",
+    [
+        ("list_instances", "/api/v2/runtime-instances"),
+        ("list_attempts", "/api/v2/runtime-instances/instance-1/attempts"),
+        ("list_jobs", "/api/v2/runtime-instances/instance-1/jobs"),
+    ],
+    ids=["management-mode", "attempt-status", "job-status"],
+)
+def test_persisted_enum_corruption_has_stable_api_error_without_evidence(
+    client: TestClient,
+    repository: FakeQueryRepository,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    path: str,
+) -> None:
+    private_value = "private-corrupt-enum-secret SELECT traceback"
+
+    def invalid_registry(*_args):
+        raise RuntimeDataError(private_value) from None
+
+    monkeypatch.setattr(repository, operation, invalid_registry)
+
+    response = client.get(path, headers=auth_headers)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "invalid_registry_data"}
+    assert private_value not in response.text
+    assert "SELECT" not in response.text
+    assert "traceback" not in response.text
 
 
 def test_ping_fails_readiness_closed_without_exception_details(
@@ -449,3 +536,37 @@ def test_imports_have_no_startup_side_effect_and_sources_have_no_forbidden_depen
         "runtime_access",
     ):
         assert forbidden not in source
+
+
+def test_main_disables_uvicorn_access_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    from freqtrade.platform_control import __main__ as main_module
+
+    settings = SimpleNamespace(
+        database=object(),
+        listen_host="127.0.0.1",
+        listen_port=8090,
+    )
+    app = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(main_module.PlatformControlSettings, "from_env", lambda: settings)
+    monkeypatch.setattr(main_module, "create_platform_engine", lambda _settings: object())
+    monkeypatch.setattr(main_module, "SqlPlatformControlQueryRepository", lambda _engine: object())
+    monkeypatch.setattr(main_module, "create_platform_app", lambda *_args: app)
+    monkeypatch.setattr(
+        main_module.uvicorn,
+        "run",
+        lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs),
+    )
+
+    main_module.main()
+
+    assert captured == {
+        "args": (app,),
+        "kwargs": {"host": "127.0.0.1", "port": 8090, "access_log": False},
+    }
+
+
+def test_app_has_no_global_pydantic_validation_error_handler(client: TestClient) -> None:
+    from pydantic import ValidationError
+
+    assert ValidationError not in client.app.exception_handlers

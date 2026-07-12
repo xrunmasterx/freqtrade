@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -50,13 +50,15 @@ def create_platform_app(  # noqa: C901
     async def invalid_registry_data(_request, _error: RuntimeDataError):
         return _json_error(status.HTTP_500_INTERNAL_SERVER_ERROR, "invalid_registry_data")
 
-    @app.exception_handler(ValidationError)
-    async def invalid_registry_validation(_request, _error: ValidationError):
-        return _json_error(status.HTTP_500_INTERNAL_SERVER_ERROR, "invalid_registry_data")
-
     @app.exception_handler(SQLAlchemyError)
     async def control_plane_unavailable(_request, _error: SQLAlchemyError):
         return _json_error(status.HTTP_503_SERVICE_UNAVAILABLE, "control_plane_unavailable")
+
+    @app.middleware("http")
+    async def reject_query_parameters(request: Request, call_next):
+        if request.scope["query_string"]:
+            return _json_error(status.HTTP_400_BAD_REQUEST, "unexpected_query_parameters")
+        return await call_next(request)
 
     app.include_router(create_auth_router(settings, platform_secrets), prefix="/api/v2")
     router = APIRouter(dependencies=[Depends(require_platform_user)])

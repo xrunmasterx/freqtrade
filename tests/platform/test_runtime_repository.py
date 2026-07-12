@@ -502,6 +502,57 @@ def test_list_attempts_rejects_invalid_health_evidence_with_stable_code(
     )
 
 
+@pytest.mark.parametrize(
+    "record_type,seed_kind,operation,column",
+    [
+        (
+            RuntimeInstanceRecord,
+            "instance",
+            lambda repository: repository.list_instances(),
+            "management_mode",
+        ),
+        (
+            RuntimeAttemptRecord,
+            "attempt",
+            lambda repository: repository.list_attempts("instance-1"),
+            "status",
+        ),
+        (
+            RuntimeLifecycleJobRecord,
+            "job",
+            lambda repository: repository.list_jobs("instance-1"),
+            "status",
+        ),
+    ],
+    ids=["management-mode", "attempt-status", "job-status"],
+)
+def test_read_views_map_persisted_enum_corruption_to_stable_data_error(
+    repository: SqlRuntimeRepository,
+    engine: Engine,
+    record_type: type,
+    seed_kind: str,
+    operation,
+    column: str,
+) -> None:
+    if seed_kind == "job":
+        _seed_instance(engine)
+        repository.create_job(_command("stop", "key-1"), "operator_cli")
+    else:
+        _seed_instance(engine)
+        if seed_kind == "attempt":
+            _seed_attempt(engine)
+    private_value = "private-corrupt-enum-secret"
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
+        connection.execute(record_type.__table__.update().values({column: private_value}))
+
+    with pytest.raises(RuntimeDataError) as exc_info:
+        operation(repository)
+
+    assert str(exc_info.value) == "invalid_registry_data"
+    assert private_value not in str(exc_info.value)
+
+
 def test_claim_orders_jobs_and_validates_lease_bounds(
     repository: SqlRuntimeRepository,
     engine: Engine,

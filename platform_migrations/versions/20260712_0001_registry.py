@@ -17,19 +17,125 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
-def _create_catalog_table() -> None:
-    op.create_table(
-        "platform_catalog_revisions",
-        sa.Column("revision_id", sa.String(length=128), nullable=False),
-        sa.Column("payload", sa.JSON(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.PrimaryKeyConstraint("revision_id"),
-        if_not_exists=True,
-    )
+_CATALOG_ADOPTION_SQL = r"""
+DO $catalog_adoption$
+DECLARE
+    catalog_oid oid;
+    revision_attnum smallint;
+    compatible boolean;
+BEGIN
+    catalog_oid := to_regclass('public.platform_catalog_revisions');
+    IF catalog_oid IS NULL THEN
+        CREATE TABLE platform_catalog_revisions (
+            revision_id varchar(128) NOT NULL,
+            payload json NOT NULL,
+            created_at timestamp with time zone NOT NULL,
+            PRIMARY KEY (revision_id)
+        );
+        RETURN;
+    END IF;
+
+    SELECT
+        relation.relkind = 'r'
+        AND relation.relpersistence = 'p'
+        AND NOT relation.relispartition
+    INTO compatible
+    FROM pg_class AS relation
+    WHERE relation.oid = catalog_oid;
+    IF NOT compatible THEN
+        RAISE EXCEPTION 'incompatible_platform_catalog_revisions';
+    END IF;
+
+    SELECT
+        count(*) = 3
+        AND count(*) FILTER (
+            WHERE attribute.attname = 'revision_id'
+              AND format_type(attribute.atttypid, attribute.atttypmod)
+                  = 'character varying(128)'
+              AND attribute.attnotnull
+              AND NOT attribute.atthasdef
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+        ) = 1
+        AND count(*) FILTER (
+            WHERE attribute.attname = 'payload'
+              AND format_type(attribute.atttypid, attribute.atttypmod) = 'json'
+              AND attribute.attnotnull
+              AND NOT attribute.atthasdef
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+        ) = 1
+        AND count(*) FILTER (
+            WHERE attribute.attname = 'created_at'
+              AND format_type(attribute.atttypid, attribute.atttypmod)
+                  = 'timestamp with time zone'
+              AND attribute.attnotnull
+              AND NOT attribute.atthasdef
+              AND attribute.attidentity = ''
+              AND attribute.attgenerated = ''
+        ) = 1
+    INTO compatible
+    FROM pg_attribute AS attribute
+    WHERE attribute.attrelid = catalog_oid
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped;
+    IF NOT compatible THEN
+        RAISE EXCEPTION 'incompatible_platform_catalog_revisions';
+    END IF;
+
+    SELECT attribute.attnum
+    INTO revision_attnum
+    FROM pg_attribute AS attribute
+    WHERE attribute.attrelid = catalog_oid
+      AND attribute.attname = 'revision_id'
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped;
+
+    SELECT
+        count(*) = 1
+        AND count(*) FILTER (
+            WHERE constraint_row.contype = 'p'
+              AND constraint_row.conkey = ARRAY[revision_attnum]::smallint[]
+              AND constraint_row.convalidated
+              AND NOT constraint_row.condeferrable
+        ) = 1
+    INTO compatible
+    FROM pg_constraint AS constraint_row
+    WHERE constraint_row.conrelid = catalog_oid;
+    IF NOT compatible THEN
+        RAISE EXCEPTION 'incompatible_platform_catalog_revisions';
+    END IF;
+
+    SELECT
+        count(*) = 1
+        AND count(*) FILTER (
+            WHERE index_row.indisprimary
+              AND index_row.indisunique
+              AND index_row.indisvalid
+              AND index_row.indisready
+              AND index_row.indnatts = 1
+              AND index_row.indnkeyatts = 1
+              AND index_row.indkey[0] = revision_attnum
+              AND index_row.indexprs IS NULL
+              AND index_row.indpred IS NULL
+        ) = 1
+    INTO compatible
+    FROM pg_index AS index_row
+    WHERE index_row.indrelid = catalog_oid;
+    IF NOT compatible THEN
+        RAISE EXCEPTION 'incompatible_platform_catalog_revisions';
+    END IF;
+END
+$catalog_adoption$
+"""
+
+
+def _adopt_or_create_catalog_table() -> None:
+    op.execute(_CATALOG_ADOPTION_SQL)
 
 
 def upgrade() -> None:
-    _create_catalog_table()
+    _adopt_or_create_catalog_table()
     op.create_table(
         "runtime_instances",
         sa.Column("instance_id", sa.String(length=128), nullable=False),
