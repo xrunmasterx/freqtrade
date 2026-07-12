@@ -2,6 +2,7 @@ import os
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Literal
 
@@ -94,7 +95,27 @@ def _read_secret(path: Path) -> str:
     return value
 
 
+def _validate_secret_file_identities(settings: PlatformControlSettings) -> None:
+    paths = (
+        settings.api_password_file,
+        settings.jwt_secret_file,
+        settings.database.password_file,
+    )
+    try:
+        canonical_paths = tuple(path.resolve(strict=True) for path in paths)
+        if any(not path.is_file() for path in canonical_paths):
+            raise OSError
+        if any(
+            left == right or left.samefile(right)
+            for left, right in combinations(canonical_paths, 2)
+        ):
+            raise OSError
+    except (OSError, RuntimeError):
+        raise PlatformControlSecretError("invalid_platform_control_secret") from None
+
+
 def load_platform_secrets(settings: PlatformControlSettings) -> _PlatformSecrets:
+    _validate_secret_file_identities(settings)
     api_password = _read_secret(settings.api_password_file)
     jwt_secret = _read_secret(settings.jwt_secret_file)
     if len(jwt_secret) < 32 or secrets.compare_digest(

@@ -1,16 +1,22 @@
 import secrets
 from collections.abc import Callable
+from math import isfinite
 
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, OAuth2PasswordBearer
 
 from freqtrade.platform_control.settings import PlatformControlSettings, _PlatformSecrets
-from freqtrade.rpc.api_server.api_auth import create_token, get_user_from_token
+from freqtrade.rpc.api_server.api_auth import create_token
 from freqtrade.rpc.api_server.api_schemas import AccessAndRefreshToken, AccessToken
 
 
 _BASIC = HTTPBasic(auto_error=False)
 _BEARER = OAuth2PasswordBearer(tokenUrl="/api/v2/token/login", auto_error=False)
+_MAX_TOKEN_LIFETIME_SECONDS = {
+    "access": 15 * 60,
+    "refresh": 30 * 24 * 60 * 60,
+}
 
 
 def _unauthorized() -> HTTPException:
@@ -45,9 +51,31 @@ def _token_user(
     platform_secrets: _PlatformSecrets,
 ) -> str:
     try:
-        username = get_user_from_token(token, platform_secrets._jwt_secret, token_type)
-    except (AttributeError, HTTPException, TypeError):
+        payload = jwt.decode(
+            token,
+            platform_secrets._jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["identity", "type", "iat", "exp"]},
+        )
+    except jwt.PyJWTError:
         raise _unauthorized() from None
+    identity = payload.get("identity")
+    issued_at = payload.get("iat")
+    expires_at = payload.get("exp")
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(issued_at, (int, float))
+        or isinstance(issued_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or isinstance(expires_at, bool)
+        or (isinstance(issued_at, float) and not isfinite(issued_at))
+        or (isinstance(expires_at, float) and not isfinite(expires_at))
+        or payload.get("type") != token_type
+        or expires_at <= issued_at
+        or expires_at - issued_at > _MAX_TOKEN_LIFETIME_SECONDS[token_type]
+    ):
+        raise _unauthorized()
+    username = identity.get("u")
     if not isinstance(username, str) or not _compare_text(username, settings.username):
         raise _unauthorized()
     return username

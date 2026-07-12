@@ -37,6 +37,7 @@ def create_platform_app(  # noqa: C901
     require_platform_user = create_platform_user_dependency(settings, platform_secrets)
     app = FastAPI(
         title="Platform Control",
+        openapi_url=None,
         docs_url=None,
         redoc_url=None,
     )

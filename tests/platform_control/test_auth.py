@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -243,6 +244,57 @@ def test_secret_reader_requires_long_jwt_secret(tmp_path: Path) -> None:
         load_platform_secrets(settings)
 
 
+@pytest.mark.parametrize("alias_kind", ["api-hardlink", "jwt-symlink"])
+def test_app_construction_rejects_secret_file_identity_aliases_without_disclosure(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    database_path = _write(
+        tmp_path / "database-password",
+        "distinct-database-password-that-is-at-least-32-characters",
+    )
+    api_path = tmp_path / "api-password"
+    jwt_path = tmp_path / "jwt-secret"
+    if alias_kind == "api-hardlink":
+        os.link(database_path, api_path)
+        _write(jwt_path, JWT_SECRET)
+    else:
+        _write(api_path, API_PASSWORD)
+        jwt_path.symlink_to(database_path)
+    settings = PlatformControlSettings(
+        username=USERNAME,
+        api_password_file=api_path,
+        jwt_secret_file=jwt_path,
+        database=PlatformDatabaseSettings(
+            host="database.internal",
+            port=5432,
+            database="platform_control",
+            username="platform_control",
+            password_file=database_path,
+        ),
+    )
+
+    with pytest.raises(PlatformControlSecretError) as exc_info:
+        create_platform_app(settings, EmptyRepository())
+
+    assert str(exc_info.value) == "invalid_platform_control_secret"
+    for hidden in (str(api_path), str(jwt_path), str(database_path), "database-password"):
+        assert hidden not in str(exc_info.value)
+
+
+def test_app_construction_rejects_database_secret_stat_failure_without_path(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    settings.database.password_file.unlink()
+
+    with pytest.raises(PlatformControlSecretError) as exc_info:
+        create_platform_app(settings, EmptyRepository())
+
+    assert str(exc_info.value) == "invalid_platform_control_secret"
+    assert str(settings.database.password_file) not in str(exc_info.value)
+
+
 def test_login_access_and_refresh_preserve_exact_hs256_payload_contract(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
@@ -336,6 +388,92 @@ def test_auth_rejects_wrong_identity_algorithm_expiry_signature_basic_and_query(
     )
     assert query.status_code == 401
     assert API_PASSWORD not in query.text
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"drop": "identity"},
+        {"drop": "type"},
+        {"drop": "iat"},
+        {"drop": "exp"},
+        {"iat": "private-non-numeric-iat"},
+        {"exp": "private-non-numeric-exp"},
+        {"iat": True},
+        {"exp": False},
+        {"iat_offset": 60, "exp_offset": 120},
+        {"iat_offset": 60, "exp_offset": 30},
+        {"iat_offset": 0, "exp_offset": 901},
+    ],
+    ids=[
+        "missing-identity",
+        "missing-type",
+        "missing-iat",
+        "missing-exp",
+        "non-numeric-iat",
+        "non-numeric-exp",
+        "bool-iat",
+        "bool-exp",
+        "future-iat",
+        "exp-before-iat",
+        "overlong-access",
+    ],
+)
+def test_access_tokens_require_valid_bounded_claims(
+    tmp_path: Path,
+    mutation: dict[str, object],
+) -> None:
+    client = _client(tmp_path)
+    now = datetime.now(UTC)
+    payload: dict[str, object] = {
+        "identity": {"u": USERNAME},
+        "type": "access",
+        "iat": now,
+        "exp": now + timedelta(minutes=15),
+    }
+    dropped = mutation.get("drop")
+    if isinstance(dropped, str):
+        payload.pop(dropped)
+    for claim in ("iat", "exp"):
+        if claim in mutation:
+            payload[claim] = mutation[claim]
+    if "iat_offset" in mutation:
+        payload["iat"] = now + timedelta(seconds=int(mutation["iat_offset"]))
+    if "exp_offset" in mutation:
+        payload["exp"] = now + timedelta(seconds=int(mutation["exp_offset"]))
+    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+    response = client.get(
+        "/api/v2/runtime-instances",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "unauthorized"}
+    assert "private-non-numeric" not in response.text
+
+
+def test_refresh_token_rejects_lifetime_over_thirty_days(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    now = datetime.now(UTC)
+    token = jwt.encode(
+        {
+            "identity": {"u": USERNAME},
+            "type": "refresh",
+            "iat": now,
+            "exp": now + timedelta(days=30, seconds=1),
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+
+    response = client.post(
+        "/api/v2/token/refresh",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "unauthorized"}
 
 
 def test_basic_auth_compares_both_username_and_password(

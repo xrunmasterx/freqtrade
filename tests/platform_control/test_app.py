@@ -190,6 +190,41 @@ def test_exact_routes_openapi_methods_and_no_lifecycle_or_access_surface(
         assert client.get(forbidden).status_code == 404
 
 
+def test_schema_http_routes_are_disabled_and_external_routes_match_allowlist(
+    client: TestClient,
+) -> None:
+    for path in ("/openapi.json", "/docs", "/redoc"):
+        assert client.get(path).status_code == 404
+
+    def collect_routes(routes, prefix: str = "") -> dict[str, set[str]]:
+        observed: dict[str, set[str]] = {}
+        for route in routes:
+            methods = getattr(route, "methods", None)
+            if methods:
+                observed.setdefault(f"{prefix}{route.path}", set()).update(methods)
+            original_router = getattr(route, "original_router", None)
+            if original_router is not None:
+                nested_prefix = f"{prefix}{route.include_context.prefix}"
+                for path, nested_methods in collect_routes(
+                    original_router.routes,
+                    nested_prefix,
+                ).items():
+                    observed.setdefault(path, set()).update(nested_methods)
+        return observed
+
+    observed = collect_routes(client.app.routes)
+    assert observed == {
+        "/api/v2/ping": {"GET", "HEAD"},
+        "/api/v2/token/login": {"POST"},
+        "/api/v2/token/refresh": {"POST"},
+        "/api/v2/catalog": {"GET", "HEAD"},
+        "/api/v2/runtime-instances": {"GET", "HEAD"},
+        "/api/v2/runtime-instances/{instance_id}": {"GET", "HEAD"},
+        "/api/v2/runtime-instances/{instance_id}/attempts": {"GET", "HEAD"},
+        "/api/v2/runtime-instances/{instance_id}/jobs": {"GET", "HEAD"},
+    }
+
+
 def test_ping_is_public_and_all_other_reads_share_auth(
     client: TestClient,
     auth_headers: dict[str, str],
