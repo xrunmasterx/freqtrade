@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from freqtrade.markets import MarketType
-from freqtrade.research import load_research_profiles
+from freqtrade.markets import MarketType, ProductType
+from freqtrade.research import load_research_profiles, research_profile_scope
 from freqtrade.research.exceptions import ResearchConfigError
 
 
@@ -34,6 +34,64 @@ def test_load_research_profiles_parses_local_csv_profile(tmp_path) -> None:
     assert profile.capabilities.account is False
     assert profile.capabilities.orders is False
     assert profile.data_root == tmp_path / "research_data" / "a_share"
+
+
+def test_legacy_a_share_profile_maps_to_equity_scope(tmp_path) -> None:
+    profile = load_research_profiles(
+        {
+            "user_data_dir": tmp_path,
+            "research_bots": [
+                {
+                    "id": "a-share-local",
+                    "label": "A Share Local",
+                    "market": "a_share",
+                    "data_source": {
+                        "type": "local_csv",
+                        "root": "research_data/a_share",
+                    },
+                }
+            ],
+        }
+    )[0]
+
+    scope = research_profile_scope(profile)
+
+    assert scope.market_id == MarketType.A_SHARE
+    assert scope.product_ids == (ProductType.EQUITY,)
+
+
+@pytest.mark.parametrize(
+    "market",
+    [
+        MarketType.DIGITAL_ASSET,
+        MarketType.CONTRACT,
+        MarketType.HK_STOCK,
+        MarketType.US_STOCK,
+    ],
+)
+def test_research_profile_scope_rejects_unsupported_market(tmp_path, market) -> None:
+    profile = load_research_profiles(
+        {
+            "user_data_dir": tmp_path,
+            "research_bots": [
+                {
+                    "id": "a-share-local",
+                    "label": "A Share Local",
+                    "market": "a_share",
+                    "data_source": {
+                        "type": "local_csv",
+                        "root": "research_data/a_share",
+                    },
+                }
+            ],
+        }
+    )[0].model_copy(update={"market": market})
+
+    with pytest.raises(
+        ResearchConfigError,
+        match=rf"Unsupported research profile market: {market}",
+    ):
+        research_profile_scope(profile)
 
 
 def test_load_research_profiles_returns_empty_list_without_research_bots(tmp_path) -> None:

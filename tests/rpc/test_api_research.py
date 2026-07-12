@@ -198,6 +198,22 @@ def test_research_bots_returns_public_profile_without_data_root(research_client)
     assert "data_root" not in body["bots"][0]
 
 
+def test_research_bots_v1_shape_is_unchanged(research_client) -> None:
+    response = client_get(research_client, f"{BASE_URI}/research/bots")
+
+    assert response.status_code == 200
+    bots = response.json()["bots"]
+    assert bots
+    for bot in bots:
+        assert set(bot) == {
+            "id",
+            "label",
+            "market",
+            "capabilities",
+        }
+        assert {"product_id", "path", "data_root", "secret"}.isdisjoint(bot)
+
+
 def test_research_bots_requires_research_webserver_mode(default_conf, tmp_path, mocker) -> None:
     with make_research_client(default_conf, tmp_path, mocker, runmode=RunMode.OTHER) as client:
         response = client_get(client, f"{BASE_URI}/research/bots")

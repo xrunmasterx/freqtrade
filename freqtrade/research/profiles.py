@@ -3,7 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from freqtrade.markets import BotCapabilities, MarketType
+from freqtrade.markets import BotCapabilities, MarketScope, MarketType, ProductType
 from freqtrade.research.exceptions import ResearchConfigError
 
 
@@ -34,6 +34,15 @@ class ResearchBotProfile(BaseModel):
     data_root: Path
     market_data_root: Path | None = None
     side_data_root: Path | None = None
+
+
+def research_profile_scope(profile: ResearchBotProfile) -> MarketScope:
+    if profile.market == MarketType.A_SHARE:
+        return MarketScope(
+            market_id=MarketType.A_SHARE,
+            product_ids=(ProductType.EQUITY,),
+        )
+    raise ResearchConfigError(f"Unsupported research profile market: {profile.market}")
 
 
 def load_research_profiles(config: dict[str, Any]) -> list[ResearchBotProfile]:
