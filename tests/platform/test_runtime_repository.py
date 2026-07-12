@@ -19,6 +19,7 @@ from freqtrade.platform.runtime_models import (
     RuntimeLifecycleJobRecord,
 )
 from freqtrade.platform.runtime_repository import (
+    CompletionStatus,
     RuntimeAuditEvent,
     RuntimeConflict,
     RuntimeDataError,
@@ -219,6 +220,28 @@ def test_create_job_checks_idempotency_before_version_and_audits_once(
     assert audits[0].provenance == {"source": "runtime_repository"}
 
 
+def test_postgres_identical_idempotency_replay_persists_only_original_mutation(
+    postgres_repository: SqlRuntimeRepository,
+    postgres_engine: Engine,
+) -> None:
+    _seed_instance(postgres_engine)
+
+    first = postgres_repository.create_job(_command("start", "key-1"), "operator_cli")
+    replay = postgres_repository.create_job(_command("start", "key-1"), "operator_cli")
+
+    assert replay == first
+    with Session(postgres_engine) as session:
+        instance = session.get(RuntimeInstanceRecord, "instance-1")
+        jobs = session.scalars(select(RuntimeLifecycleJobRecord)).all()
+        audits = session.scalars(select(RuntimeAuditEventRecord)).all()
+        assert instance is not None
+        assert instance.desired_state == "running"
+        assert instance.optimistic_version == 1
+        assert len(jobs) == 1
+        assert jobs[0].job_id == first.job_id
+        assert len(audits) == 1
+
+
 @pytest.mark.parametrize(
     ("action", "version"),
     [("stop", 0), ("start", 1)],
@@ -240,6 +263,37 @@ def test_create_job_rejects_conflicting_idempotency_payload(
     assert _counts(engine) == (1, 1, 1)
 
 
+@pytest.mark.parametrize(
+    ("action", "version"),
+    [("stop", 0), ("start", 1)],
+    ids=["different-action", "different-expected-version"],
+)
+def test_postgres_conflicting_idempotency_payload_preserves_original_state(
+    postgres_repository: SqlRuntimeRepository,
+    postgres_engine: Engine,
+    action: str,
+    version: int,
+) -> None:
+    _seed_instance(postgres_engine)
+    original = postgres_repository.create_job(_command("start", "key-1"), "operator_cli")
+
+    with pytest.raises(RuntimeConflict, match=r"^idempotency_key_conflict$"):
+        postgres_repository.create_job(_command(action, "key-1", version=version), "operator_cli")
+
+    with Session(postgres_engine) as session:
+        instance = session.get(RuntimeInstanceRecord, "instance-1")
+        jobs = session.scalars(select(RuntimeLifecycleJobRecord)).all()
+        audits = session.scalars(select(RuntimeAuditEventRecord)).all()
+        assert instance is not None
+        assert instance.desired_state == "running"
+        assert instance.optimistic_version == 1
+        assert len(jobs) == 1
+        assert jobs[0].job_id == original.job_id
+        assert jobs[0].requested_action == "start"
+        assert jobs[0].expected_instance_version == 0
+        assert len(audits) == 1
+
+
 def test_stale_version_rolls_back_everything(
     repository: SqlRuntimeRepository,
     engine: Engine,
@@ -252,6 +306,23 @@ def test_stale_version_rolls_back_everything(
     assert repository.get_instance("instance-1").optimistic_version == 0
     assert repository.list_jobs("instance-1") == ()
     assert _counts(engine) == (1, 0, 0)
+
+
+def test_postgres_stale_version_rolls_back_every_persisted_effect(
+    postgres_repository: SqlRuntimeRepository,
+    postgres_engine: Engine,
+) -> None:
+    _seed_instance(postgres_engine)
+
+    with pytest.raises(RuntimeConflict, match=r"^stale_instance_version$"):
+        postgres_repository.create_job(_command("start", "key-1", version=9), "operator_cli")
+
+    with Session(postgres_engine) as session:
+        instance = session.get(RuntimeInstanceRecord, "instance-1")
+        assert instance is not None
+        assert instance.desired_state == "stopped"
+        assert instance.optimistic_version == 0
+    assert _counts(postgres_engine) == (1, 0, 0)
 
 
 @pytest.mark.parametrize("postgres", [False, True], ids=["sqlite", "postgres"])
@@ -267,9 +338,13 @@ def test_audit_failure_rolls_back_instance_job_and_audit(
     def fail_audit(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("injected_audit_failure")
 
-    monkeypatch.setattr(repository, "_append_audit_record", fail_audit)
-    with pytest.raises(RuntimeError, match="injected_audit_failure"):
-        repository.create_job(_command("start", "key-1"), "operator_cli")
+    original_audit_boundary = repository._append_audit_record
+    with monkeypatch.context() as audit_failure:
+        audit_failure.setattr(repository, "_append_audit_record", fail_audit)
+        with pytest.raises(RuntimeError, match="injected_audit_failure"):
+            repository.create_job(_command("start", "key-1"), "operator_cli")
+
+    assert repository._append_audit_record == original_audit_boundary
 
     assert repository.get_instance("instance-1").optimistic_version == 0
     assert repository.list_jobs("instance-1") == ()
@@ -600,6 +675,50 @@ def test_expired_lease_is_reconciled_before_pending_claim(
     assert _counts(engine) == (2, 2, 4)
 
 
+@pytest.mark.parametrize("expired_status", ["claimed", "running"])
+def test_postgres_expired_lease_is_reconciled_before_pending_claim(
+    postgres_repository: SqlRuntimeRepository,
+    postgres_engine: Engine,
+    clock: MutableClock,
+    expired_status: str,
+) -> None:
+    _seed_instance(postgres_engine, "instance-a")
+    _seed_instance(postgres_engine, "instance-b")
+    postgres_repository.create_job(
+        _command("start", "key-a", instance_id="instance-a"), "operator_cli"
+    )
+    pending = postgres_repository.create_job(
+        _command("start", "key-b", instance_id="instance-b"), "operator_cli"
+    )
+    claimed = postgres_repository.claim_next_job("supervisor-a", lease_seconds=10)
+    assert claimed is not None
+    if expired_status == "running":
+        with Session(postgres_engine) as session, session.begin():
+            record = session.get(RuntimeLifecycleJobRecord, claimed.job_id)
+            assert record is not None
+            record.status = "running"
+    clock.now += timedelta(seconds=11)
+
+    reconciled = postgres_repository.claim_next_job("supervisor-b", lease_seconds=10)
+
+    assert reconciled is not None
+    assert reconciled.job_id == claimed.job_id
+    assert reconciled.status == "needs_reconciliation"
+    assert reconciled.failure_code == "stale_lease"
+    assert reconciled.completed_at == clock.now
+    with Session(postgres_engine) as session:
+        expired_record = session.get(RuntimeLifecycleJobRecord, claimed.job_id)
+        pending_record = session.get(RuntimeLifecycleJobRecord, pending.job_id)
+        assert expired_record is not None
+        assert expired_record.status == "needs_reconciliation"
+        assert expired_record.failure_code == "stale_lease"
+        assert expired_record.lease_owner is None
+        assert expired_record.lease_expires_at is None
+        assert pending_record is not None
+        assert pending_record.status == "pending"
+    assert _counts(postgres_engine) == (2, 2, 4)
+
+
 def test_complete_job_enforces_failure_code_and_late_completion(
     repository: SqlRuntimeRepository,
     engine: Engine,
@@ -624,6 +743,45 @@ def test_complete_job_enforces_failure_code_and_late_completion(
     assert completed.lease_owner is None
     assert completed.lease_expires_at is None
     assert _counts(engine) == (1, 1, 3)
+
+
+@pytest.mark.parametrize(
+    ("requested_status", "requested_failure_code"),
+    [("succeeded", None), ("failed", "launch_failed")],
+)
+def test_postgres_late_completion_requires_reconciliation(
+    postgres_repository: SqlRuntimeRepository,
+    postgres_engine: Engine,
+    clock: MutableClock,
+    requested_status: CompletionStatus,
+    requested_failure_code: str | None,
+) -> None:
+    _seed_instance(postgres_engine)
+    postgres_repository.create_job(_command("start", "key-1"), "operator_cli")
+    claimed = postgres_repository.claim_next_job("supervisor-a", lease_seconds=10)
+    assert claimed is not None
+    clock.now += timedelta(seconds=11)
+
+    completed = postgres_repository.complete_job(
+        claimed.job_id,
+        requested_status,
+        requested_failure_code,
+    )
+
+    assert completed.status == "needs_reconciliation"
+    assert completed.failure_code == "stale_lease"
+    assert completed.completed_at == clock.now
+    assert completed.lease_owner is None
+    assert completed.lease_expires_at is None
+    with Session(postgres_engine) as session:
+        record = session.get(RuntimeLifecycleJobRecord, claimed.job_id)
+        assert record is not None
+        assert record.status == "needs_reconciliation"
+        assert record.failure_code == "stale_lease"
+        assert record.completed_at == clock.now
+        assert record.lease_owner is None
+        assert record.lease_expires_at is None
+    assert _counts(postgres_engine) == (1, 1, 3)
 
 
 def test_success_and_failure_completion_are_terminal(
