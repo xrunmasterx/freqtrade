@@ -55,6 +55,16 @@ class RuntimeAction(StrEnum):
     RETIRE = "retire"
 
 
+class RuntimeAuditAction(StrEnum):
+    START = "start"
+    STOP = "stop"
+    RETRY = "retry"
+    RETIRE = "retire"
+    PUBLISH_TEMPLATE = "publish_template"
+    DEPRECATE_TEMPLATE = "deprecate_template"
+    REVOKE_TEMPLATE = "revoke_template"
+
+
 class RuntimeJobStatus(StrEnum):
     PENDING = "pending"
     CLAIMED = "claimed"

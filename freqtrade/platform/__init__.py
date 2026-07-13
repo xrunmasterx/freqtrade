@@ -14,6 +14,7 @@ from freqtrade.platform.runtime_domain import (
     RuntimeAction,
     RuntimeAttemptStatus,
     RuntimeAttemptView,
+    RuntimeAuditAction,
     RuntimeDesiredState,
     RuntimeInstanceView,
     RuntimeJobStatus,
@@ -51,15 +52,26 @@ from freqtrade.platform.template_domain import (
     StateAllocationStatus,
     TemplateStatus,
 )
+from freqtrade.platform.template_repository import (
+    AdapterTemplateRevisionView,
+    CommittedTemplatePublication,
+    SqlTemplateRepository,
+    TemplateConflict,
+    TemplateInvalidTransition,
+    TemplateNotFound,
+)
 
 
 __all__ = [
     "AdapterTemplate",
+    "AdapterTemplateRevisionView",
     "CatalogRepository",
+    "CommittedTemplatePublication",
     "FrozenPlatformModel",
     "PlatformBase",
     "PlatformDatabaseSettings",
     "RuntimeAction",
+    "RuntimeAuditAction",
     "RuntimeApplicationService",
     "RuntimeAuditEvent",
     "RuntimeAttemptStatus",
@@ -87,11 +99,15 @@ __all__ = [
     "SecretReferenceStatus",
     "SqlCatalogRepository",
     "SqlRuntimeRepository",
+    "SqlTemplateRepository",
     "StateAllocation",
     "StateAllocationKind",
     "StateAllocationStatus",
     "StaticCatalogRepository",
     "TemplateStatus",
+    "TemplateConflict",
+    "TemplateInvalidTransition",
+    "TemplateNotFound",
     "create_platform_engine",
     "platform_session",
 ]
