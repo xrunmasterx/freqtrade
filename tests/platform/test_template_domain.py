@@ -5,6 +5,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from freqtrade.markets import MarketType, ProductType
 from freqtrade.platform.runtime_domain import RuntimeOwnerKind, RuntimeOwnerRef
 
 
@@ -50,12 +51,59 @@ def _runtime_spec_envelope(canonical_payload: str) -> dict[str, str]:
     }
 
 
+def _runtime_spec_payload() -> dict[str, object]:
+    return {
+        "owner_ref": _owner_scope().model_dump(mode="json"),
+        "instance_kind": "execution-worker",
+        "catalog_revision_id": "catalog-revision-1",
+        "market_scope": {
+            "market_id": MarketType.DIGITAL_ASSET,
+            "product_ids": (ProductType.SPOT,),
+            "venue_ids": ("binance",),
+            "instrument_keys": ("BTC.USDT:spot",),
+        },
+        "environment": "paper",
+        "adapter_template_revision_id": "adapter-template-revision-1",
+        "template_digest": "a" * 64,
+        "image_policy_id": "signed-freqtrade-image",
+        "command_policy_id": "freqtrade-supervisor-command",
+        "mount_policy_ids": ("runtime-userdata",),
+        "network_policy_id": "internal-runtime-network",
+        "health_profile_id": "freqtrade-http-health",
+        "resource_profile_id": "paper-probe-small",
+        "state_layout_id": "freqtrade-userdata-v1",
+        "state_allocation_id": "state-allocation-1",
+        "secret_reference_ids": ("secret-reference-1",),
+        "config_blob_commit": "1" * 40,
+        "strategy_commit": "2" * 40,
+        "safety_policy_commit": "3" * 40,
+        "root_commit": "4" * 40,
+        "backend_commit": "5" * 64,
+        "frontend_commit": "6" * 40,
+        "strategies_commit": "7" * 40,
+        "config_blob_digest": "8" * 64,
+        "strategy_digest": "9" * 64,
+        "safety_policy_digest": "a" * 64,
+    }
+
+
+def _canonical_runtime_spec_payload() -> str:
+    return json.dumps(
+        _runtime_spec_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def test_public_contracts_are_exported_with_closed_enum_values() -> None:
     domain, runtime_spec = _domain_modules()
     platform = importlib.import_module("freqtrade.platform")
     expected_exports = {
         "AdapterTemplate",
         "FrozenPlatformModel",
+        "RuntimeMarketScope",
+        "RuntimeSpecPayload",
         "RuntimeSpecRevision",
         "SecretReference",
         "SecretReferenceStatus",
@@ -86,6 +134,8 @@ def test_public_contracts_are_exported_with_closed_enum_values() -> None:
         "retired",
     }
     assert runtime_spec.RuntimeSpecRevision is platform.RuntimeSpecRevision
+    assert runtime_spec.RuntimeMarketScope is platform.RuntimeMarketScope
+    assert runtime_spec.RuntimeSpecPayload is platform.RuntimeSpecPayload
 
 
 def test_adapter_template_is_exact_frozen_and_rejects_container_power_fields() -> None:
@@ -155,8 +205,11 @@ def test_adapter_template_requires_nonempty_unique_tuples(
 
 def test_runtime_spec_revision_canonicalizes_hashes_and_freezes_payload() -> None:
     _domain, runtime_spec = _domain_modules()
-    first_payload = {"z": 1, "a": {"y": [2, 1], "x": "汉字"}}
-    second_payload = {"a": {"x": "汉字", "y": [2, 1]}, "z": 1}
+    first_payload = _runtime_spec_payload()
+    second_payload = dict(reversed(first_payload.items()))
+    market_scope = first_payload["market_scope"]
+    assert isinstance(market_scope, dict)
+    second_payload["market_scope"] = dict(reversed(market_scope.items()))
     expected_json = json.dumps(
         first_payload,
         sort_keys=True,
@@ -167,7 +220,7 @@ def test_runtime_spec_revision_canonicalizes_hashes_and_freezes_payload() -> Non
 
     first = runtime_spec.RuntimeSpecRevision.from_payload(first_payload)
     second = runtime_spec.RuntimeSpecRevision.from_payload(second_payload)
-    first_payload["new"] = "later-mutation"
+    first_payload["owner_ref"] = "later-mutation"
 
     assert first == second
     assert first.canonical_payload == expected_json
@@ -189,69 +242,182 @@ def test_runtime_spec_revision_canonicalizes_hashes_and_freezes_payload() -> Non
         )
 
 
-@pytest.mark.parametrize(
-    "forbidden_key",
-    [
-        "secret_value",
-        "secret_values",
-        "secret_path",
-        "secret_paths",
-        "secret_content",
-        "secret_content_hash",
-        "secret_hash",
-        "credential",
-        "credentials",
-        "password",
-        "passwords",
-        "token",
-        "tokens",
-        "api_key",
-        "api_secret",
-        "private_key",
-        "authorization",
-        "cookie",
-        "dsn",
-        "host_path",
-        "host_paths",
-    ],
-)
-def test_runtime_spec_rejects_top_level_sensitive_keys_without_echoing_values(
-    forbidden_key: str,
-) -> None:
+def test_runtime_spec_payload_is_exact_frozen_and_accepts_only_stable_references() -> None:
     _domain, runtime_spec = _domain_modules()
-    secret_marker = "fictional-runtime-secret-value"
+    payload = runtime_spec.RuntimeSpecPayload.model_validate(_runtime_spec_payload())
 
-    with pytest.raises(ValueError) as exc_info:
-        runtime_spec.RuntimeSpecRevision.from_payload({forbidden_key: secret_marker})
+    assert set(type(payload).model_fields) == set(_runtime_spec_payload())
+    assert payload.model_config["frozen"] is True
+    assert payload.model_config["extra"] == "forbid"
+    assert payload.model_config["hide_input_in_errors"] is True
+    assert payload.secret_reference_ids == ("secret-reference-1",)
 
-    assert str(exc_info.value) == "runtime_spec_sensitive_key_forbidden"
-    assert secret_marker not in str(exc_info.value)
-    assert secret_marker not in repr(exc_info.value)
-
-
-def test_runtime_spec_recurses_lists_and_allows_secret_reference_identity() -> None:
-    _domain, runtime_spec = _domain_modules()
-    secret_marker = "fictional-nested-runtime-secret"
-
-    with pytest.raises(ValueError) as exc_info:
-        runtime_spec.RuntimeSpecRevision.from_payload(
-            {"outer": [{"nested": {"api_secret": secret_marker}}]}
-        )
-
-    assert str(exc_info.value) == "runtime_spec_sensitive_key_forbidden"
-    assert secret_marker not in repr(exc_info.value)
-
-    revision = runtime_spec.RuntimeSpecRevision.from_payload(
-        {"secret_reference_ids": ["secret-reference-1"]}
-    )
+    revision = runtime_spec.RuntimeSpecRevision.from_payload(payload)
     assert "secret-reference-1" in revision.canonical_payload
 
 
-def test_runtime_spec_direct_construction_cannot_bypass_sensitive_key_boundary() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "config_blob_commit",
+        "strategy_commit",
+        "safety_policy_commit",
+        "root_commit",
+        "backend_commit",
+        "frontend_commit",
+        "strategies_commit",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", ["a" * 39, "A" * 40, "g" * 40])
+def test_runtime_spec_payload_accepts_only_lowercase_git_object_ids(
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+
+    with pytest.raises(ValidationError):
+        runtime_spec.RuntimeSpecPayload.model_validate(
+            {**_runtime_spec_payload(), field_name: invalid_value}
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "template_digest",
+        "config_blob_digest",
+        "strategy_digest",
+        "safety_policy_digest",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", ["a" * 63, "A" * 64, "g" * 64])
+def test_runtime_spec_payload_accepts_only_lowercase_sha256_digests(
+    field_name: str,
+    invalid_value: str,
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+
+    with pytest.raises(ValidationError):
+        runtime_spec.RuntimeSpecPayload.model_validate(
+            {**_runtime_spec_payload(), field_name: invalid_value}
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("mount_policy_ids", ()),
+        ("mount_policy_ids", ("runtime-userdata", "runtime-userdata")),
+        ("secret_reference_ids", ("secret-reference-1", "secret-reference-1")),
+    ],
+)
+def test_runtime_spec_payload_requires_unique_reference_tuples(
+    field_name: str,
+    invalid_value: tuple[str, ...],
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+
+    with pytest.raises(ValidationError):
+        runtime_spec.RuntimeSpecPayload.model_validate(
+            {**_runtime_spec_payload(), field_name: invalid_value}
+        )
+
+
+def test_runtime_market_scope_is_closed_and_preserves_opaque_instrument_keys() -> None:
+    _domain, runtime_spec = _domain_modules()
+    scope = runtime_spec.RuntimeMarketScope(
+        market_id=MarketType.DIGITAL_ASSET,
+        product_ids=(ProductType.SPOT,),
+        venue_ids=("binance",),
+        instrument_keys=("BTC.USDT:spot",),
+    )
+
+    assert set(type(scope).model_fields) == {
+        "market_id",
+        "product_ids",
+        "venue_ids",
+        "instrument_keys",
+    }
+    assert scope.instrument_keys == ("BTC.USDT:spot",)
+
+    invalid_values = (
+        {"product_ids": ()},
+        {"product_ids": (ProductType.SPOT, ProductType.SPOT)},
+        {"venue_ids": ("binance", "binance")},
+        {"instrument_keys": ("BTC.USDT:spot", "BTC.USDT:spot")},
+        {"instrument_keys": ("",)},
+        {"instrument_keys": ("x" * 257,)},
+        {"connector": "forbidden"},
+    )
+    base_values = scope.model_dump()
+    for changes in invalid_values:
+        with pytest.raises(ValidationError):
+            runtime_spec.RuntimeMarketScope(**{**base_values, **changes})
+
+
+@pytest.mark.parametrize(
+    ("extra_key", "extra_value", "nested"),
+    [
+        ("client_secret", "fictional-client-secret", False),
+        ("access_token", "fictional-access-token", False),
+        ("refresh_token", "fictional-refresh-token", False),
+        ("client_credentials", "fictional-client-credentials", False),
+        ("CLIENT_SECRET", "fictional-uppercase-secret", False),
+        ("client-secret", "fictional-hyphen-secret", False),
+        (" client_secret ", "fictional-whitespace-secret", False),
+        ("client_credentials", {"value": "fictional-nested-object-secret"}, True),
+        ("refresh_token", ["fictional-nested-array-secret"], True),
+    ],
+    ids=[
+        "client-secret",
+        "access-token",
+        "refresh-token",
+        "client-credentials",
+        "case-variant",
+        "connector-variant",
+        "whitespace-variant",
+        "nested-object",
+        "nested-array",
+    ],
+)
+def test_runtime_spec_closed_payload_rejects_extra_keys_without_echoing_values(
+    extra_key: str,
+    extra_value: object,
+    nested: bool,
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+    payload = _runtime_spec_payload()
+    target = payload["market_scope"] if nested else payload
+    assert isinstance(target, dict)
+    target[extra_key] = extra_value
+
+    with pytest.raises(ValidationError) as exc_info:
+        runtime_spec.RuntimeSpecRevision.from_payload(payload)
+
+    error_text = str(exc_info.value)
+    error_repr = repr(exc_info.value)
+    for marker in (
+        "fictional-client-secret",
+        "fictional-access-token",
+        "fictional-refresh-token",
+        "fictional-client-credentials",
+        "fictional-uppercase-secret",
+        "fictional-hyphen-secret",
+        "fictional-whitespace-secret",
+        "fictional-nested-object-secret",
+        "fictional-nested-array-secret",
+    ):
+        assert marker not in error_text
+        assert marker not in error_repr
+
+
+def test_runtime_spec_direct_construction_cannot_bypass_closed_payload_boundary() -> None:
     _domain, runtime_spec = _domain_modules()
     secret_marker = "fictional-direct-runtime-secret"
+    payload = _runtime_spec_payload()
+    payload["access_token"] = {"nested": [secret_marker]}
     canonical_payload = json.dumps(
-        {"nested": {"password": secret_marker}},
+        payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -260,9 +426,26 @@ def test_runtime_spec_direct_construction_cannot_bypass_sensitive_key_boundary()
     with pytest.raises(ValidationError) as exc_info:
         runtime_spec.RuntimeSpecRevision(**_runtime_spec_envelope(canonical_payload))
 
-    assert "runtime_spec_sensitive_key_forbidden" in str(exc_info.value)
+    assert "runtime_spec_payload_invalid" in str(exc_info.value)
     assert secret_marker not in str(exc_info.value)
     assert secret_marker not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["fictional-top-level-string", ["fictional-top-level-list"], 17, None],
+    ids=["string", "list", "number", "null"],
+)
+def test_runtime_spec_direct_construction_rejects_non_object_payloads(payload: object) -> None:
+    _domain, runtime_spec = _domain_modules()
+    canonical_payload = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        runtime_spec.RuntimeSpecRevision(**_runtime_spec_envelope(canonical_payload))
+
+    assert "runtime_spec_payload_not_object" in str(exc_info.value)
+    assert "fictional-top-level" not in str(exc_info.value)
+    assert "fictional-top-level" not in repr(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -277,12 +460,12 @@ def test_runtime_spec_direct_construction_cannot_bypass_sensitive_key_boundary()
             "runtime_spec_payload_invalid_json",
         ),
         (
-            _runtime_spec_envelope('{"z":1, "a":2}'),
+            _runtime_spec_envelope(json.dumps(_runtime_spec_payload(), ensure_ascii=False)),
             "runtime_spec_payload_not_canonical",
         ),
         (
             {
-                **_runtime_spec_envelope("{}"),
+                **_runtime_spec_envelope(_canonical_runtime_spec_payload()),
                 "runtime_spec_revision_id": f"runtime-spec-{'0' * 64}",
                 "payload_digest": "0" * 64,
             },
@@ -290,7 +473,7 @@ def test_runtime_spec_direct_construction_cannot_bypass_sensitive_key_boundary()
         ),
         (
             {
-                **_runtime_spec_envelope("{}"),
+                **_runtime_spec_envelope(_canonical_runtime_spec_payload()),
                 "runtime_spec_revision_id": f"runtime-spec-{'0' * 64}",
             },
             "runtime_spec_revision_id_mismatch",
@@ -298,7 +481,7 @@ def test_runtime_spec_direct_construction_cannot_bypass_sensitive_key_boundary()
         (
             {
                 "runtime_spec_revision_id": f"runtime-spec-{'g' * 64}",
-                "canonical_payload": "{}",
+                "canonical_payload": _canonical_runtime_spec_payload(),
                 "payload_digest": "g" * 64,
             },
             "runtime_spec_payload_digest_invalid",

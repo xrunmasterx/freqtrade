@@ -36,7 +36,11 @@ from freqtrade.platform.runtime_repository import (
     SqlRuntimeRepository,
 )
 from freqtrade.platform.runtime_service import RuntimeApplicationService
-from freqtrade.platform.runtime_spec import RuntimeSpecRevision
+from freqtrade.platform.runtime_spec import (
+    RuntimeMarketScope,
+    RuntimeSpecPayload,
+    RuntimeSpecRevision,
+)
 from freqtrade.platform.template_domain import (
     AdapterTemplate,
     FrozenPlatformModel,
@@ -76,6 +80,8 @@ __all__ = [
     "RuntimeOwnerRef",
     "RuntimeQueryRepository",
     "RuntimeRepository",
+    "RuntimeMarketScope",
+    "RuntimeSpecPayload",
     "RuntimeSpecRevision",
     "SecretReference",
     "SecretReferenceStatus",

@@ -1,35 +1,18 @@
 import hashlib
 import json
+from typing import Annotated, Literal
 
-from pydantic import model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
-from freqtrade.platform.runtime_domain import Identifier
+from freqtrade.markets.catalog import ProductType
+from freqtrade.markets.instrument import MarketType
+from freqtrade.platform.runtime_domain import Identifier, RuntimeOwnerRef
 from freqtrade.platform.template_domain import FrozenPlatformModel
 
 
-_SENSITIVE_PAYLOAD_KEYS = {
-    "api_key",
-    "api_secret",
-    "authorization",
-    "cookie",
-    "credential",
-    "credentials",
-    "dsn",
-    "host_path",
-    "host_paths",
-    "password",
-    "passwords",
-    "private_key",
-    "secret_content",
-    "secret_content_hash",
-    "secret_hash",
-    "secret_path",
-    "secret_paths",
-    "secret_value",
-    "secret_values",
-    "token",
-    "tokens",
-}
+_LowercaseSha256Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+_GitObjectId = Annotated[str, Field(pattern=r"^([0-9a-f]{40}|[0-9a-f]{64})$")]
+_InstrumentKey = Annotated[str, Field(min_length=1, max_length=256)]
 
 
 def _canonicalize(payload: object) -> str:
@@ -41,15 +24,54 @@ def _canonicalize(payload: object) -> str:
     )
 
 
-def _reject_sensitive_keys(value: object) -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if isinstance(key, str) and key.casefold() in _SENSITIVE_PAYLOAD_KEYS:
-                raise ValueError("runtime_spec_sensitive_key_forbidden")
-            _reject_sensitive_keys(child)
-    elif isinstance(value, list):
-        for child in value:
-            _reject_sensitive_keys(child)
+class RuntimeMarketScope(FrozenPlatformModel):
+    market_id: MarketType
+    product_ids: tuple[ProductType, ...] = Field(min_length=1)
+    venue_ids: tuple[Identifier, ...] = ()
+    instrument_keys: tuple[_InstrumentKey, ...] = ()
+
+    @field_validator("product_ids", "venue_ids", "instrument_keys")
+    @classmethod
+    def require_unique_tuple(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate values are not allowed")
+        return value
+
+
+class RuntimeSpecPayload(FrozenPlatformModel):
+    owner_ref: RuntimeOwnerRef
+    instance_kind: Identifier
+    catalog_revision_id: Identifier
+    market_scope: RuntimeMarketScope
+    environment: Literal["paper", "live"]
+    adapter_template_revision_id: Identifier
+    template_digest: _LowercaseSha256Digest
+    image_policy_id: Identifier
+    command_policy_id: Identifier
+    mount_policy_ids: tuple[Identifier, ...] = Field(min_length=1)
+    network_policy_id: Identifier
+    health_profile_id: Identifier
+    resource_profile_id: Identifier
+    state_layout_id: Identifier
+    state_allocation_id: Identifier
+    secret_reference_ids: tuple[Identifier, ...]
+    config_blob_commit: _GitObjectId
+    strategy_commit: _GitObjectId
+    safety_policy_commit: _GitObjectId
+    root_commit: _GitObjectId
+    backend_commit: _GitObjectId
+    frontend_commit: _GitObjectId
+    strategies_commit: _GitObjectId
+    config_blob_digest: _LowercaseSha256Digest
+    strategy_digest: _LowercaseSha256Digest
+    safety_policy_digest: _LowercaseSha256Digest
+
+    @field_validator("mount_policy_ids", "secret_reference_ids")
+    @classmethod
+    def require_unique_tuple(cls, value: tuple[Identifier, ...]) -> tuple[Identifier, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("duplicate values are not allowed")
+        return value
 
 
 class RuntimeSpecRevision(FrozenPlatformModel):
@@ -60,13 +82,20 @@ class RuntimeSpecRevision(FrozenPlatformModel):
     @model_validator(mode="after")
     def validate_envelope(self) -> "RuntimeSpecRevision":
         try:
-            payload = json.loads(self.canonical_payload)
+            decoded_payload = json.loads(self.canonical_payload)
         except json.JSONDecodeError:
             raise ValueError("runtime_spec_payload_invalid_json") from None
 
-        if _canonicalize(payload) != self.canonical_payload:
+        if not isinstance(decoded_payload, dict):
+            raise ValueError("runtime_spec_payload_not_object")
+        try:
+            payload = RuntimeSpecPayload.model_validate(decoded_payload)
+        except ValidationError:
+            raise ValueError("runtime_spec_payload_invalid") from None
+
+        canonical_payload = _canonicalize(payload.model_dump(mode="json"))
+        if canonical_payload != self.canonical_payload:
             raise ValueError("runtime_spec_payload_not_canonical")
-        _reject_sensitive_keys(payload)
         if len(self.payload_digest) != 64 or any(
             character not in "0123456789abcdef" for character in self.payload_digest
         ):
@@ -80,9 +109,12 @@ class RuntimeSpecRevision(FrozenPlatformModel):
         return self
 
     @classmethod
-    def from_payload(cls, payload: dict[str, object]) -> "RuntimeSpecRevision":
-        _reject_sensitive_keys(payload)
-        canonical_payload = _canonicalize(payload)
+    def from_payload(
+        cls,
+        payload: RuntimeSpecPayload | dict[str, object],
+    ) -> "RuntimeSpecRevision":
+        validated_payload = RuntimeSpecPayload.model_validate(payload)
+        canonical_payload = _canonicalize(validated_payload.model_dump(mode="json"))
         payload_digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
         return cls(
             runtime_spec_revision_id=f"runtime-spec-{payload_digest}",
