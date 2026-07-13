@@ -348,9 +348,10 @@ class SqlTemplateRepository:
             )
             if record is None:
                 raise TemplateNotFound("template_revision_not_found")
-            current_status = TemplateStatus(record.status)
+            current_view = self._view(record)
+            current_status = current_view.status
             if current_status is target_status:
-                return self._view(record)
+                return current_view
             if current_status is TemplateStatus.REVOKED or (
                 target_status is TemplateStatus.DEPRECATED
                 and current_status is not TemplateStatus.ACTIVE

@@ -487,6 +487,57 @@ def test_get_rejects_corrupted_persisted_template_with_stable_error(
         repository.get_template_revision(f"template-{digest}")
 
 
+@pytest.mark.parametrize("transition", ["deprecate", "revoke"])
+def test_transition_rejects_corrupted_persisted_template_before_mutation(
+    transition: str,
+    engine: Engine,
+    repository: SqlTemplateRepository,
+) -> None:
+    committed = _publication()
+    revision_id = f"template-{committed.payload_digest}"
+    with engine.begin() as connection:
+        connection.execute(
+            insert(AdapterTemplateRevisionRecord).values(
+                **_record_values(
+                    committed,
+                    status="active",
+                    deprecated_at=NOW + timedelta(days=1),
+                )
+            )
+        )
+    with Session(engine) as session:
+        record = session.get(AdapterTemplateRevisionRecord, revision_id)
+        assert record is not None
+        before = {
+            column.name: getattr(record, column.name)
+            for column in AdapterTemplateRevisionRecord.__table__.columns
+        }
+
+    with pytest.raises(TemplateDataError, match=r"^invalid_template_revision_data$"):
+        if transition == "deprecate":
+            repository.deprecate_template(
+                revision_id,
+                "platform-admin",
+                NOW + timedelta(days=2),
+            )
+        else:
+            repository.revoke_template(
+                revision_id,
+                "platform-admin",
+                NOW + timedelta(days=2),
+            )
+
+    with Session(engine) as session:
+        record = session.get(AdapterTemplateRevisionRecord, revision_id)
+        assert record is not None
+        after = {
+            column.name: getattr(record, column.name)
+            for column in AdapterTemplateRevisionRecord.__table__.columns
+        }
+        assert after == before
+        assert session.scalar(select(func.count()).select_from(RuntimeAuditEventRecord)) == 0
+
+
 def test_status_transitions_are_atomic_immutable_and_idempotent(
     engine: Engine,
     repository: SqlTemplateRepository,
