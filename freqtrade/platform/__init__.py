@@ -57,6 +57,7 @@ from freqtrade.platform.template_repository import (
     CommittedTemplatePublication,
     SqlTemplateRepository,
     TemplateConflict,
+    TemplateDataError,
     TemplateInvalidTransition,
     TemplateNotFound,
 )
@@ -106,6 +107,7 @@ __all__ = [
     "StaticCatalogRepository",
     "TemplateStatus",
     "TemplateConflict",
+    "TemplateDataError",
     "TemplateInvalidTransition",
     "TemplateNotFound",
     "create_platform_engine",

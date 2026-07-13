@@ -24,6 +24,7 @@ from freqtrade.platform.template_repository import (
     CommittedTemplatePublication,
     SqlTemplateRepository,
     TemplateConflict,
+    TemplateDataError,
     TemplateInvalidTransition,
     TemplateNotFound,
 )
@@ -99,6 +100,33 @@ def _publication(
     return CommittedTemplatePublication.model_validate(values)
 
 
+def _record_values(
+    committed: CommittedTemplatePublication,
+    *,
+    published_by: str = "competing-admin",
+    **updates: object,
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        "adapter_template_revision_id": f"template-{committed.payload_digest}",
+        "template_id": committed.template.template_id,
+        "semantic_version": committed.template.semantic_version,
+        "canonical_payload": committed.canonical_payload,
+        "payload_digest": committed.payload_digest,
+        "source_commit": committed.source_commit,
+        "root_commit": committed.root_commit,
+        "backend_commit": committed.backend_commit,
+        "frontend_commit": committed.frontend_commit,
+        "strategies_commit": committed.strategies_commit,
+        "status": "active",
+        "published_by": published_by,
+        "published_at": NOW,
+        "deprecated_at": None,
+        "revoked_at": None,
+    }
+    values.update(updates)
+    return values
+
+
 @pytest.fixture
 def engine() -> Engine:
     value = create_engine("sqlite+pysqlite:///:memory:")
@@ -169,6 +197,41 @@ def test_committed_publication_rejects_template_and_digest_mismatch_without_payl
     canonical = _canonical_payload(_template())
     with pytest.raises(ValidationError, match="template_payload_digest_mismatch"):
         _publication(canonical_payload=canonical, payload_digest="0" * 64)
+
+
+@pytest.mark.parametrize("corruption", ["canonical", "digest", "source_commit"])
+def test_publish_revalidates_model_copy_before_opening_session(
+    corruption: str,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    committed = _publication()
+    if corruption == "canonical":
+        payload = committed.canonical_payload.replace(":", ": ", 1)
+        updates = {
+            "canonical_payload": payload,
+            "payload_digest": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        }
+    elif corruption == "digest":
+        updates = {"payload_digest": "0" * 64}
+    else:
+        updates = {"source_commit": "5" * 40}
+    bypassed = committed.model_copy(update=updates)
+
+    import freqtrade.platform.template_repository as repository_module
+
+    def fail_if_session_opens(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("session opened before publication revalidation")
+
+    monkeypatch.setattr(repository_module, "Session", fail_if_session_opens)
+    repository = SqlTemplateRepository(engine, id_factory=SequentialIds())
+
+    with pytest.raises(ValidationError):
+        repository.publish_template(bypassed, "platform-admin", NOW)
+
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AdapterTemplateRevisionRecord)) == 0
+        assert session.scalar(select(func.count()).select_from(RuntimeAuditEventRecord)) == 0
 
 
 def test_publish_round_trips_revision_and_atomic_audit(
@@ -260,23 +323,7 @@ def _install_template_race(
         inserted = True
         with engine.begin() as competing_connection:
             competing_connection.execute(
-                insert(AdapterTemplateRevisionRecord).values(
-                    adapter_template_revision_id=f"template-{competitor.payload_digest}",
-                    template_id=competitor.template.template_id,
-                    semantic_version=competitor.template.semantic_version,
-                    canonical_payload=competitor.canonical_payload,
-                    payload_digest=competitor.payload_digest,
-                    source_commit=competitor.source_commit,
-                    root_commit=competitor.root_commit,
-                    backend_commit=competitor.backend_commit,
-                    frontend_commit=competitor.frontend_commit,
-                    strategies_commit=competitor.strategies_commit,
-                    status="active",
-                    published_by="competing-admin",
-                    published_at=NOW,
-                    deprecated_at=None,
-                    revoked_at=None,
-                )
+                insert(AdapterTemplateRevisionRecord).values(**_record_values(competitor))
             )
 
 
@@ -357,6 +404,87 @@ def test_publish_rolls_back_revision_when_audit_insert_fails(
     with Session(engine) as session:
         assert session.scalar(select(func.count()).select_from(AdapterTemplateRevisionRecord)) == 0
         assert session.scalar(select(func.count()).select_from(RuntimeAuditEventRecord)) == 0
+
+
+def test_audit_integrity_error_is_not_reclassified_after_competitor_appears(
+    engine: Engine,
+    repository: SqlTemplateRepository,
+) -> None:
+    committed = _publication()
+    forced_error = IntegrityError("forced audit failure", {}, RuntimeError("unrelated"))
+    competitor_inserted = False
+
+    def fail_audit_insert(
+        _connection: Connection,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if statement.lstrip().startswith("INSERT INTO runtime_audit_events"):
+            raise forced_error
+
+    def insert_competitor_after_rollback(rolled_back_session: Session) -> None:
+        nonlocal competitor_inserted
+        if competitor_inserted or rolled_back_session.bind is not engine:
+            return
+        competitor_inserted = True
+        with engine.begin() as competing_connection:
+            competing_connection.execute(
+                insert(AdapterTemplateRevisionRecord).values(
+                    **_record_values(committed, published_by="external-competitor")
+                )
+            )
+
+    event.listen(engine, "before_cursor_execute", fail_audit_insert)
+    event.listen(Session, "after_rollback", insert_competitor_after_rollback)
+    try:
+        with pytest.raises(IntegrityError) as exc_info:
+            repository.publish_template(committed, "platform-admin", NOW)
+    finally:
+        event.remove(Session, "after_rollback", insert_competitor_after_rollback)
+        event.remove(engine, "before_cursor_execute", fail_audit_insert)
+
+    assert exc_info.value is forced_error
+    assert competitor_inserted
+    with Session(engine) as session:
+        records = session.scalars(select(AdapterTemplateRevisionRecord)).all()
+        assert len(records) == 1
+        assert records[0].published_by == "external-competitor"
+        assert session.scalar(select(func.count()).select_from(RuntimeAuditEventRecord)) == 0
+
+
+@pytest.mark.parametrize("corruption", ["digest_mismatch", "non_canonical"])
+def test_get_rejects_corrupted_persisted_template_with_stable_error(
+    corruption: str,
+    engine: Engine,
+    repository: SqlTemplateRepository,
+) -> None:
+    committed = _publication()
+    if corruption == "digest_mismatch":
+        digest = "f" * 64
+        updates = {
+            "adapter_template_revision_id": f"template-{digest}",
+            "payload_digest": digest,
+        }
+    else:
+        payload = committed.canonical_payload.replace(":", ": ", 1)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        updates = {
+            "adapter_template_revision_id": f"template-{digest}",
+            "canonical_payload": payload,
+            "payload_digest": digest,
+        }
+    with engine.begin() as connection:
+        connection.execute(
+            insert(AdapterTemplateRevisionRecord).values(
+                **_record_values(committed, **updates)
+            )
+        )
+
+    with pytest.raises(TemplateDataError, match=r"^invalid_template_revision_data$"):
+        repository.get_template_revision(f"template-{digest}")
 
 
 def test_status_transitions_are_atomic_immutable_and_idempotent(
