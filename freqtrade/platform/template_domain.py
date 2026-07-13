@@ -7,7 +7,7 @@ from freqtrade.platform.runtime_domain import Identifier, RuntimeOwnerKind, Runt
 
 
 class FrozenPlatformModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
 
 class TemplateStatus(StrEnum):

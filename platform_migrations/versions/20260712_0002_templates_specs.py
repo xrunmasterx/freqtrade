@@ -77,6 +77,13 @@ _PLACEHOLDER_FOREIGN_KEYS = (
 )
 
 
+def _lower_hex_check(column_name: str) -> str:
+    expression = column_name
+    for character in "0123456789abcdef":
+        expression = f"replace({expression}, '{character}', '')"
+    return f"{expression} = ''"
+
+
 def _control_migration_schema() -> None:
     op.execute(_CONTROLLED_SCHEMA_SQL)
     op.execute(_CONTROLLED_SCHEMA_GUARD_SQL)
@@ -149,6 +156,14 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "generation >= 1",
             name="ck_state_allocations_generation",
+        ),
+        sa.CheckConstraint(
+            "instance_id <> '' AND "
+            "replace(instance_id, '/', '') = instance_id AND "
+            "replace(instance_id, '\\', '') = instance_id AND "
+            "replace(instance_id, '.', '') = instance_id AND "
+            "relative_path = 'ft_userdata/runtime/instances/' || instance_id",
+            name="ck_state_allocations_relative_path",
         ),
         sa.PrimaryKeyConstraint("state_allocation_id"),
         sa.UniqueConstraint(
@@ -248,6 +263,14 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "length(payload_digest) = 64",
             name="ck_runtime_spec_revisions_payload_digest_length",
+        ),
+        sa.CheckConstraint(
+            _lower_hex_check("payload_digest"),
+            name="ck_runtime_spec_revisions_payload_digest_hex",
+        ),
+        sa.CheckConstraint(
+            "runtime_spec_revision_id = 'runtime-spec-' || payload_digest",
+            name="ck_runtime_spec_revisions_revision_id",
         ),
         sa.ForeignKeyConstraint(
             ["catalog_revision_id"],

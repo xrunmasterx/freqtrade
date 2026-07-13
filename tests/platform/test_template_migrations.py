@@ -121,6 +121,7 @@ EXPECTED_CHECKS = {
         "ck_state_allocations_generation",
         "ck_state_allocations_kind",
         "ck_state_allocations_provider_id",
+        "ck_state_allocations_relative_path",
         "ck_state_allocations_status",
     },
     "secret_references": {
@@ -132,16 +133,78 @@ EXPECTED_CHECKS = {
     "runtime_spec_revisions": {
         "ck_runtime_spec_revisions_environment",
         "ck_runtime_spec_revisions_owner_kind",
+        "ck_runtime_spec_revisions_payload_digest_hex",
         "ck_runtime_spec_revisions_payload_digest_length",
+        "ck_runtime_spec_revisions_revision_id",
     },
 }
 PLACEHOLDER_FOREIGN_KEYS = {
-    "fk_runtime_instances_runtime_spec_revision_id",
-    "fk_runtime_instances_state_allocation_id",
-    "fk_runtime_attempts_runtime_spec_revision_id",
-    "fk_runtime_attempts_adapter_template_revision_id",
-    "fk_runtime_audit_events_runtime_spec_revision_id",
-    "fk_runtime_audit_events_adapter_template_revision_id",
+    "fk_runtime_instances_runtime_spec_revision_id": (
+        "runtime_instances",
+        "runtime_spec_revision_id",
+        "runtime_spec_revisions",
+        "runtime_spec_revision_id",
+    ),
+    "fk_runtime_instances_state_allocation_id": (
+        "runtime_instances",
+        "state_allocation_id",
+        "state_allocations",
+        "state_allocation_id",
+    ),
+    "fk_runtime_attempts_runtime_spec_revision_id": (
+        "runtime_attempts",
+        "runtime_spec_revision_id",
+        "runtime_spec_revisions",
+        "runtime_spec_revision_id",
+    ),
+    "fk_runtime_attempts_adapter_template_revision_id": (
+        "runtime_attempts",
+        "adapter_template_revision_id",
+        "adapter_template_revisions",
+        "adapter_template_revision_id",
+    ),
+    "fk_runtime_audit_events_runtime_spec_revision_id": (
+        "runtime_audit_events",
+        "runtime_spec_revision_id",
+        "runtime_spec_revisions",
+        "runtime_spec_revision_id",
+    ),
+    "fk_runtime_audit_events_adapter_template_revision_id": (
+        "runtime_audit_events",
+        "adapter_template_revision_id",
+        "adapter_template_revisions",
+        "adapter_template_revision_id",
+    ),
+}
+INTERNAL_FOREIGN_KEYS = {
+    "secret_version_metadata": {
+        "fk_secret_version_metadata_secret_reference_id": (
+            ("secret_reference_id",),
+            "secret_references",
+            ("secret_reference_id",),
+            "RESTRICT",
+        ),
+    },
+    "runtime_spec_revisions": {
+        "fk_runtime_spec_revisions_catalog_revision_id": (
+            ("catalog_revision_id",),
+            "platform_catalog_revisions",
+            ("revision_id",),
+            "RESTRICT",
+        ),
+        "fk_runtime_spec_revisions_adapter_template_revision_id": (
+            ("adapter_template_revision_id",),
+            "adapter_template_revisions",
+            ("adapter_template_revision_id",),
+            "RESTRICT",
+        ),
+        "fk_runtime_spec_revisions_state_allocation_id": (
+            ("state_allocation_id",),
+            "state_allocations",
+            ("state_allocation_id",),
+            "RESTRICT",
+        ),
+    },
 }
 
 
@@ -257,7 +320,6 @@ def _allocation_values(allocation_id: str = "allocation-1", **updates) -> dict[s
         "instance_id": "instance-1",
         "layout_id": "freqtrade-userdata-v1",
         "provider_id": "managed-local-v1",
-        "relative_path": f"ft_userdata/runtime/instances/{allocation_id}",
         "kind": "fresh",
         "status": "reserved",
         "generation": 1,
@@ -267,6 +329,10 @@ def _allocation_values(allocation_id: str = "allocation-1", **updates) -> dict[s
         "retired_at": None,
     }
     values.update(updates)
+    values.setdefault(
+        "relative_path",
+        f"ft_userdata/runtime/instances/{values['instance_id']}",
+    )
     return values
 
 
@@ -287,9 +353,9 @@ def _secret_reference_values(reference_id: str = "secret-reference-1", **updates
     return values
 
 
-def _runtime_spec_values(revision_id: str = "runtime-spec-1", **updates):
+def _runtime_spec_values(payload_digest: str = "b" * 64, **updates):
     values = {
-        "runtime_spec_revision_id": revision_id,
+        "runtime_spec_revision_id": f"runtime-spec-{payload_digest}",
         "owner_kind": "paper_probe",
         "owner_id": "paper-probe-1",
         "owner_revision": "paper-probe-v1",
@@ -299,7 +365,7 @@ def _runtime_spec_values(revision_id: str = "runtime-spec-1", **updates):
         "adapter_template_revision_id": "template-revision-1",
         "state_allocation_id": "allocation-1",
         "canonical_payload": "{}",
-        "payload_digest": "b" * 64,
+        "payload_digest": payload_digest,
         "created_at": NOW,
     }
     values.update(updates)
@@ -341,6 +407,32 @@ def test_revision_chain_and_shared_metadata_define_the_exact_task1_schema() -> N
             for constraint in table.constraints
             if isinstance(constraint, CheckConstraint)
         } == EXPECTED_CHECKS[table_name]
+
+    state_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in PlatformBase.metadata.tables["state_allocations"].constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    path_check = state_checks["ck_state_allocations_relative_path"]
+    assert "instance_id <> ''" in path_check
+    assert "replace(instance_id, '/', '') = instance_id" in path_check
+    assert "replace(instance_id, '\\', '') = instance_id" in path_check
+    assert "replace(instance_id, '.', '') = instance_id" in path_check
+    assert (
+        "relative_path = 'ft_userdata/runtime/instances/' || instance_id" in path_check
+    )
+
+    runtime_spec_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in PlatformBase.metadata.tables["runtime_spec_revisions"].constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    digest_check = runtime_spec_checks["ck_runtime_spec_revisions_payload_digest_hex"]
+    assert digest_check.count("replace(") == 16
+    assert all(f"'{character}'" in digest_check for character in "0123456789abcdef")
+    assert runtime_spec_checks["ck_runtime_spec_revisions_revision_id"] == (
+        "runtime_spec_revision_id = 'runtime-spec-' || payload_digest"
+    )
 
     assert isinstance(
         PlatformBase.metadata.tables["adapter_template_revisions"].c.canonical_payload.type,
@@ -384,7 +476,7 @@ def test_revision_chain_and_shared_metadata_define_the_exact_task1_schema() -> N
         for constraint in PlatformBase.metadata.tables[table_name].constraints
         if isinstance(constraint, ForeignKeyConstraint)
     }
-    assert PLACEHOLDER_FOREIGN_KEYS <= metadata_placeholder_fks
+    assert set(PLACEHOLDER_FOREIGN_KEYS) <= metadata_placeholder_fks
 
     forbidden_tokens = (
         "secret_value",
@@ -435,15 +527,72 @@ def test_nonempty_0001_upgrade_preserves_identity_and_uses_not_valid_fks(
                 for name, table in tables.items()
             }
             constraints = connection.exec_driver_sql(
-                "SELECT conname, convalidated, confdeltype "
-                "FROM pg_constraint WHERE conname IN ("
+                "SELECT constraint_row.conname, "
+                "source_namespace.nspname AS source_schema, "
+                "source_table.relname AS source_table, "
+                "source_column.attname AS source_column, "
+                "target_namespace.nspname AS target_schema, "
+                "target_table.relname AS target_table, "
+                "target_column.attname AS target_column, "
+                "cardinality(constraint_row.conkey) AS source_column_count, "
+                "cardinality(constraint_row.confkey) AS target_column_count, "
+                "constraint_row.convalidated, constraint_row.confdeltype "
+                "FROM pg_constraint AS constraint_row "
+                "JOIN pg_class AS source_table "
+                "ON source_table.oid = constraint_row.conrelid "
+                "JOIN pg_namespace AS source_namespace "
+                "ON source_namespace.oid = source_table.relnamespace "
+                "JOIN pg_attribute AS source_column "
+                "ON source_column.attrelid = source_table.oid "
+                "AND source_column.attnum = constraint_row.conkey[1] "
+                "JOIN pg_class AS target_table "
+                "ON target_table.oid = constraint_row.confrelid "
+                "JOIN pg_namespace AS target_namespace "
+                "ON target_namespace.oid = target_table.relnamespace "
+                "JOIN pg_attribute AS target_column "
+                "ON target_column.attrelid = target_table.oid "
+                "AND target_column.attnum = constraint_row.confkey[1] "
+                "WHERE constraint_row.contype = 'f' AND constraint_row.conname IN ("
                 + ",".join(f"'{name}'" for name in sorted(PLACEHOLDER_FOREIGN_KEYS))
                 + ")"
             ).all()
         assert after == before
-        assert {row.conname for row in constraints} == PLACEHOLDER_FOREIGN_KEYS
-        assert all(row.convalidated is False for row in constraints)
-        assert all(row.confdeltype == "r" for row in constraints)
+        actual_constraints = {
+            row.conname: (
+                row.source_schema,
+                row.source_table,
+                row.source_column,
+                row.target_schema,
+                row.target_table,
+                row.target_column,
+                row.source_column_count,
+                row.target_column_count,
+                row.convalidated,
+                row.confdeltype,
+            )
+            for row in constraints
+        }
+        expected_constraints = {
+            name: (
+                "public",
+                source_table,
+                source_column,
+                "public",
+                target_table,
+                target_column,
+                1,
+                1,
+                False,
+                "r",
+            )
+            for name, (
+                source_table,
+                source_column,
+                target_table,
+                target_column,
+            ) in PLACEHOLDER_FOREIGN_KEYS.items()
+        }
+        assert actual_constraints == expected_constraints
 
         _expect_integrity_error(
             engine,
@@ -485,6 +634,9 @@ def test_postgres_schema_has_exact_lengths_constraints_indexes_and_restrictive_f
             assert {
                 unique["name"] for unique in schema.get_unique_constraints(table_name)
             } == EXPECTED_UNIQUES[table_name]
+            assert set(schema.get_pk_constraint(table_name)["constrained_columns"]) == (
+                EXPECTED_PRIMARY_KEYS[table_name]
+            )
 
         expected_lengths = {
             "adapter_template_revisions": {
@@ -595,32 +747,32 @@ def test_postgres_schema_has_exact_lengths_constraints_indexes_and_restrictive_f
         }
         assert set(re.findall(r"'([a-z_]+)'", secret_predicate)) == {"active"}
 
-        internal_foreign_keys = {
-            "secret_version_metadata": {
-                ("secret_reference_id", "secret_references", "secret_reference_id")
-            },
-            "runtime_spec_revisions": {
-                ("catalog_revision_id", "platform_catalog_revisions", "revision_id"),
-                (
-                    "adapter_template_revision_id",
-                    "adapter_template_revisions",
-                    "adapter_template_revision_id",
-                ),
-                ("state_allocation_id", "state_allocations", "state_allocation_id"),
-            },
-        }
-        for table_name, expected_foreign_keys in internal_foreign_keys.items():
+        for table_name, expected_foreign_keys in INTERNAL_FOREIGN_KEYS.items():
             actual = {
-                (
-                    foreign_key["constrained_columns"][0],
+                foreign_key["name"]: (
+                    tuple(foreign_key["constrained_columns"]),
                     foreign_key["referred_table"],
-                    foreign_key["referred_columns"][0],
+                    tuple(foreign_key["referred_columns"]),
+                    foreign_key["options"].get("ondelete"),
                 )
                 for foreign_key in schema.get_foreign_keys(table_name)
-                if foreign_key["options"].get("ondelete") == "RESTRICT"
             }
             assert actual == expected_foreign_keys
         assert schema.get_foreign_keys("state_allocations") == []
+
+        internal_names = {
+            name for foreign_keys in INTERNAL_FOREIGN_KEYS.values() for name in foreign_keys
+        }
+        with schema.bind.connect() as connection:
+            internal_constraints = connection.exec_driver_sql(
+                "SELECT conname, convalidated, confdeltype FROM pg_constraint "
+                "WHERE conname IN ("
+                + ",".join(f"'{name}'" for name in sorted(internal_names))
+                + ")"
+            ).all()
+        assert {
+            row.conname: (row.convalidated, row.confdeltype) for row in internal_constraints
+        } == {name: (True, "r") for name in internal_names}
     finally:
         schema.bind.dispose()
 
@@ -676,10 +828,19 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
             tables["state_allocations"],
             _allocation_values("allocation-2", status="ready"),
         )
+        _expect_integrity_error(
+            engine,
+            tables["state_allocations"],
+            _allocation_values("allocation-retired", status="retired"),
+        )
         with engine.begin() as connection:
             connection.execute(
                 insert(tables["state_allocations"]).values(
-                    **_allocation_values("allocation-retired", status="retired")
+                    **_allocation_values(
+                        "allocation-other-instance",
+                        instance_id="other-instance",
+                        status="retired",
+                    )
                 )
             )
         _expect_integrity_error(
@@ -708,7 +869,7 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
         _expect_integrity_error(
             engine,
             tables["runtime_spec_revisions"],
-            _runtime_spec_values("runtime-spec-2"),
+            _runtime_spec_values(),
         )
         _expect_integrity_error(
             engine,
@@ -769,6 +930,57 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
                 ),
             ),
             (
+                "state_allocations",
+                _allocation_values(
+                    "bad-path-mismatch",
+                    instance_id="bad-path-mismatch",
+                    relative_path="ft_userdata/runtime/instances/mismatched-instance",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-path-absolute",
+                    instance_id="bad-path-absolute",
+                    relative_path="/absolute/runtime-state",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-instance-empty",
+                    instance_id="",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-instance-forward-slash",
+                    instance_id="nested/instance",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-instance-backslash",
+                    instance_id=r"nested\instance",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-instance-dot",
+                    instance_id="instance.with-dot",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-path-traversal",
+                    instance_id="../escape",
+                ),
+            ),
+            (
                 "secret_references",
                 _secret_reference_values(
                     "bad-secret-provider",
@@ -806,24 +1018,30 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
             (
                 "runtime_spec_revisions",
                 _runtime_spec_values(
-                    "bad-spec-environment",
+                    "e" * 64,
                     environment="simulation",
-                    payload_digest="e" * 64,
                 ),
             ),
             (
                 "runtime_spec_revisions",
                 _runtime_spec_values(
-                    "bad-spec-owner-kind",
+                    "f" * 64,
                     owner_kind="operator",
-                    payload_digest="f" * 64,
                 ),
             ),
             (
                 "runtime_spec_revisions",
+                _runtime_spec_values("short"),
+            ),
+            (
+                "runtime_spec_revisions",
+                _runtime_spec_values("g" * 64),
+            ),
+            (
+                "runtime_spec_revisions",
                 _runtime_spec_values(
-                    "bad-spec-digest",
-                    payload_digest="short",
+                    "c" * 64,
+                    runtime_spec_revision_id="runtime-spec-wrong-id",
                 ),
             ),
         )

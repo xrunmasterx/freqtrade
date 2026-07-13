@@ -21,6 +21,13 @@ from freqtrade.platform.runtime_models import (
 )
 
 
+def _lower_hex_check(column_name: str) -> str:
+    expression = column_name
+    for character in "0123456789abcdef":
+        expression = f"replace({expression}, '{character}', '')"
+    return f"{expression} = ''"
+
+
 class AdapterTemplateRevisionRecord(PlatformBase):
     __tablename__ = "adapter_template_revisions"
     __table_args__ = (
@@ -88,6 +95,14 @@ class StateAllocationRecord(PlatformBase):
         CheckConstraint(
             "generation >= 1",
             name="ck_state_allocations_generation",
+        ),
+        CheckConstraint(
+            "instance_id <> '' AND "
+            "replace(instance_id, '/', '') = instance_id AND "
+            "replace(instance_id, '\\', '') = instance_id AND "
+            "replace(instance_id, '.', '') = instance_id AND "
+            "relative_path = 'ft_userdata/runtime/instances/' || instance_id",
+            name="ck_state_allocations_relative_path",
         ),
     )
 
@@ -200,6 +215,14 @@ class RuntimeSpecRevisionRecord(PlatformBase):
         CheckConstraint(
             "length(payload_digest) = 64",
             name="ck_runtime_spec_revisions_payload_digest_length",
+        ),
+        CheckConstraint(
+            _lower_hex_check("payload_digest"),
+            name="ck_runtime_spec_revisions_payload_digest_hex",
+        ),
+        CheckConstraint(
+            "runtime_spec_revision_id = 'runtime-spec-' || payload_digest",
+            name="ck_runtime_spec_revisions_revision_id",
         ),
     )
 

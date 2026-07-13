@@ -41,6 +41,15 @@ def _owner_scope() -> RuntimeOwnerRef:
     )
 
 
+def _runtime_spec_envelope(canonical_payload: str) -> dict[str, str]:
+    payload_digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    return {
+        "runtime_spec_revision_id": f"runtime-spec-{payload_digest}",
+        "canonical_payload": canonical_payload,
+        "payload_digest": payload_digest,
+    }
+
+
 def test_public_contracts_are_exported_with_closed_enum_values() -> None:
     domain, runtime_spec = _domain_modules()
     platform = importlib.import_module("freqtrade.platform")
@@ -86,6 +95,7 @@ def test_adapter_template_is_exact_frozen_and_rejects_container_power_fields() -
     assert set(type(template).model_fields) == set(_template_values())
     assert template.model_config["frozen"] is True
     assert template.model_config["extra"] == "forbid"
+    assert template.model_config["hide_input_in_errors"] is True
     with pytest.raises(ValidationError):
         template.template_id = "changed"
 
@@ -179,6 +189,137 @@ def test_runtime_spec_revision_canonicalizes_hashes_and_freezes_payload() -> Non
         )
 
 
+@pytest.mark.parametrize(
+    "forbidden_key",
+    [
+        "secret_value",
+        "secret_values",
+        "secret_path",
+        "secret_paths",
+        "secret_content",
+        "secret_content_hash",
+        "secret_hash",
+        "credential",
+        "credentials",
+        "password",
+        "passwords",
+        "token",
+        "tokens",
+        "api_key",
+        "api_secret",
+        "private_key",
+        "authorization",
+        "cookie",
+        "dsn",
+        "host_path",
+        "host_paths",
+    ],
+)
+def test_runtime_spec_rejects_top_level_sensitive_keys_without_echoing_values(
+    forbidden_key: str,
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+    secret_marker = "fictional-runtime-secret-value"
+
+    with pytest.raises(ValueError) as exc_info:
+        runtime_spec.RuntimeSpecRevision.from_payload({forbidden_key: secret_marker})
+
+    assert str(exc_info.value) == "runtime_spec_sensitive_key_forbidden"
+    assert secret_marker not in str(exc_info.value)
+    assert secret_marker not in repr(exc_info.value)
+
+
+def test_runtime_spec_recurses_lists_and_allows_secret_reference_identity() -> None:
+    _domain, runtime_spec = _domain_modules()
+    secret_marker = "fictional-nested-runtime-secret"
+
+    with pytest.raises(ValueError) as exc_info:
+        runtime_spec.RuntimeSpecRevision.from_payload(
+            {"outer": [{"nested": {"api_secret": secret_marker}}]}
+        )
+
+    assert str(exc_info.value) == "runtime_spec_sensitive_key_forbidden"
+    assert secret_marker not in repr(exc_info.value)
+
+    revision = runtime_spec.RuntimeSpecRevision.from_payload(
+        {"secret_reference_ids": ["secret-reference-1"]}
+    )
+    assert "secret-reference-1" in revision.canonical_payload
+
+
+def test_runtime_spec_direct_construction_cannot_bypass_sensitive_key_boundary() -> None:
+    _domain, runtime_spec = _domain_modules()
+    secret_marker = "fictional-direct-runtime-secret"
+    canonical_payload = json.dumps(
+        {"nested": {"password": secret_marker}},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        runtime_spec.RuntimeSpecRevision(**_runtime_spec_envelope(canonical_payload))
+
+    assert "runtime_spec_sensitive_key_forbidden" in str(exc_info.value)
+    assert secret_marker not in str(exc_info.value)
+    assert secret_marker not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_code"),
+    [
+        (
+            {
+                "runtime_spec_revision_id": f"runtime-spec-{'a' * 64}",
+                "canonical_payload": "not-json",
+                "payload_digest": "a" * 64,
+            },
+            "runtime_spec_payload_invalid_json",
+        ),
+        (
+            _runtime_spec_envelope('{"z":1, "a":2}'),
+            "runtime_spec_payload_not_canonical",
+        ),
+        (
+            {
+                **_runtime_spec_envelope("{}"),
+                "runtime_spec_revision_id": f"runtime-spec-{'0' * 64}",
+                "payload_digest": "0" * 64,
+            },
+            "runtime_spec_payload_digest_mismatch",
+        ),
+        (
+            {
+                **_runtime_spec_envelope("{}"),
+                "runtime_spec_revision_id": f"runtime-spec-{'0' * 64}",
+            },
+            "runtime_spec_revision_id_mismatch",
+        ),
+        (
+            {
+                "runtime_spec_revision_id": f"runtime-spec-{'g' * 64}",
+                "canonical_payload": "{}",
+                "payload_digest": "g" * 64,
+            },
+            "runtime_spec_payload_digest_invalid",
+        ),
+    ],
+    ids=["not-json", "not-canonical", "wrong-digest", "wrong-id", "nonhex-digest"],
+)
+def test_runtime_spec_rejects_inconsistent_envelopes_with_stable_codes(
+    values: dict[str, str],
+    expected_code: str,
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+
+    with pytest.raises(ValidationError) as exc_info:
+        runtime_spec.RuntimeSpecRevision(**values)
+
+    assert expected_code in str(exc_info.value)
+    assert values["canonical_payload"] not in str(exc_info.value)
+    assert values["canonical_payload"] not in repr(exc_info.value)
+
+
 def test_state_allocation_derives_only_the_platform_relative_path() -> None:
     domain, _runtime_spec = _domain_modules()
     allocation_values = {
@@ -252,13 +393,14 @@ def test_secret_reference_contains_no_secret_material_or_location() -> None:
     }
     assert reference.model_config["frozen"] is True
     assert reference.model_config["extra"] == "forbid"
-    for field_name in (
-        "secret_value",
-        "credential",
-        "content_hash",
-        "secret_path",
-        "host_path",
-    ):
+    assert reference.model_config["hide_input_in_errors"] is True
+    secret_marker = "fictional-secret-reference-value"
+    with pytest.raises(ValidationError) as exc_info:
+        domain.SecretReference(**reference.model_dump(), secret_value=secret_marker)
+    assert secret_marker not in str(exc_info.value)
+    assert secret_marker not in repr(exc_info.value)
+
+    for field_name in ("credential", "content_hash", "secret_path", "host_path"):
         with pytest.raises(ValidationError):
             domain.SecretReference(**reference.model_dump(), **{field_name: "forbidden"})
     with pytest.raises(ValidationError):
