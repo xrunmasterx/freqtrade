@@ -20,10 +20,10 @@ def start_new_config(args: dict[str, Any]) -> None:
         ask_user_overwrite,
         deploy_new_config,
     )
-    from freqtrade.configuration.directory_operations import chown_user_directory
+    from freqtrade.configuration.directory_operations import ensure_user_directory_access
 
     config_path = Path(args["config"][0])
-    chown_user_directory(config_path.parent)
+    ensure_user_directory_access(config_path.parent)
     if config_path.exists():
         overwrite = ask_user_overwrite(config_path)
         if overwrite:

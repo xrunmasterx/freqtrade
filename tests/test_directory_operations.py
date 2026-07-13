@@ -6,10 +6,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from freqtrade.configuration.directory_operations import (
-    chown_user_directory,
     copy_sample_files,
     create_datadir,
     create_userdata_dir,
+    ensure_user_directory_access,
 )
 from freqtrade.exceptions import OperationalException
 from tests.conftest import log_has, log_has_re
@@ -36,22 +36,57 @@ def test_create_userdata_dir(mocker, tmp_path, caplog) -> None:
     assert str(x) == str(tmp_path / "bar")
 
 
-def test_create_userdata_dir_and_chown(mocker, tmp_path, caplog) -> None:
-    sp_mock = mocker.patch("subprocess.check_output")
-    path = tmp_path / "bar"
-    assert not path.is_dir()
+def test_ensure_user_directory_access_ignores_non_docker(mocker, tmp_path) -> None:
+    access_mock = mocker.patch("os.access", return_value=False)
+    mocker.patch(
+        "freqtrade.configuration.directory_operations.running_in_docker",
+        return_value=False,
+    )
 
-    x = create_userdata_dir(str(path), create_dir=True)
-    assert sp_mock.call_count == 0
-    assert log_has(f"Created user-data directory: {path}", caplog)
-    assert isinstance(x, Path)
-    assert path.is_dir()
-    assert (path / "data").is_dir()
+    ensure_user_directory_access(tmp_path)
 
-    os.environ["FT_APP_ENV"] = "docker"
-    chown_user_directory(path / "data")
-    assert sp_mock.call_count == 1
-    del os.environ["FT_APP_ENV"]
+    access_mock.assert_not_called()
+
+
+def test_ensure_user_directory_access_accepts_writable_docker_path(mocker, tmp_path) -> None:
+    mocker.patch(
+        "freqtrade.configuration.directory_operations.running_in_docker",
+        return_value=True,
+    )
+    access_mock = mocker.patch("os.access", return_value=True)
+
+    ensure_user_directory_access(tmp_path)
+
+    access_mock.assert_called_once_with(tmp_path, os.R_OK | os.W_OK | os.X_OK)
+
+
+def test_ensure_user_directory_access_rejects_inaccessible_docker_path(
+    mocker, tmp_path
+) -> None:
+    mocker.patch(
+        "freqtrade.configuration.directory_operations.running_in_docker",
+        return_value=True,
+    )
+    mocker.patch("os.access", return_value=False)
+
+    with pytest.raises(
+        OperationalException,
+        match="not readable, writable, and searchable by the container user",
+    ):
+        ensure_user_directory_access(tmp_path)
+
+
+def test_ensure_user_directory_access_allows_missing_path(mocker, tmp_path) -> None:
+    missing = tmp_path / "will-be-created"
+    mocker.patch(
+        "freqtrade.configuration.directory_operations.running_in_docker",
+        return_value=True,
+    )
+    access_mock = mocker.patch("os.access")
+
+    ensure_user_directory_access(missing)
+
+    access_mock.assert_not_called()
 
 
 def test_create_userdata_dir_exists(mocker, tmp_path) -> None:

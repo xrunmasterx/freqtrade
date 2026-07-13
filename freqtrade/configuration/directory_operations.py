@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -30,18 +31,17 @@ def create_datadir(config: Config, datadir: str | None = None) -> Path:
     return folder
 
 
-def chown_user_directory(directory: Path) -> None:
-    """
-    Use Sudo to change permissions of the home-directory if necessary
-    Only applies when running in docker!
-    """
-    if running_in_docker():
-        try:
-            import subprocess  # noqa: S404, RUF100
+def ensure_user_directory_access(directory: Path) -> None:
+    """Fail closed when an existing Docker bind mount is inaccessible to ftuser."""
+    if not running_in_docker() or not directory.exists():
+        return
 
-            subprocess.check_output(["sudo", "chown", "-R", "ftuser:", str(directory.resolve())])
-        except Exception:
-            logger.warning(f"Could not chown {directory}")
+    required = os.R_OK | os.W_OK | os.X_OK
+    if not os.access(directory, required):
+        raise OperationalException(
+            f"Directory `{directory}` is not readable, writable, and searchable by the "
+            "container user. Fix the host directory ownership or permissions before startup."
+        )
 
 
 def create_userdata_dir(directory: str, create_dir: bool = False) -> Path:
@@ -66,7 +66,7 @@ def create_userdata_dir(directory: str, create_dir: bool = False) -> Path:
         USERPATH_FREQAIMODELS,
     ]
     folder = Path(directory)
-    chown_user_directory(folder)
+    ensure_user_directory_access(folder)
     if not folder.is_dir():
         if create_dir:
             folder.mkdir(parents=True)
