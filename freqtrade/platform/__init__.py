@@ -1,3 +1,4 @@
+from freqtrade.platform import template_models as _template_models  # noqa: F401
 from freqtrade.platform.catalog_repository import (
     CatalogRepository,
     SqlCatalogRepository,
@@ -35,10 +36,23 @@ from freqtrade.platform.runtime_repository import (
     SqlRuntimeRepository,
 )
 from freqtrade.platform.runtime_service import RuntimeApplicationService
+from freqtrade.platform.runtime_spec import RuntimeSpecRevision
+from freqtrade.platform.template_domain import (
+    AdapterTemplate,
+    FrozenPlatformModel,
+    SecretReference,
+    SecretReferenceStatus,
+    StateAllocation,
+    StateAllocationKind,
+    StateAllocationStatus,
+    TemplateStatus,
+)
 
 
 __all__ = [
+    "AdapterTemplate",
     "CatalogRepository",
+    "FrozenPlatformModel",
     "PlatformBase",
     "PlatformDatabaseSettings",
     "RuntimeAction",
@@ -62,9 +76,16 @@ __all__ = [
     "RuntimeOwnerRef",
     "RuntimeQueryRepository",
     "RuntimeRepository",
+    "RuntimeSpecRevision",
+    "SecretReference",
+    "SecretReferenceStatus",
     "SqlCatalogRepository",
     "SqlRuntimeRepository",
+    "StateAllocation",
+    "StateAllocationKind",
+    "StateAllocationStatus",
     "StaticCatalogRepository",
+    "TemplateStatus",
     "create_platform_engine",
     "platform_session",
 ]
