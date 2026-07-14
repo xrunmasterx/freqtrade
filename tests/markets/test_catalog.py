@@ -252,11 +252,11 @@ def test_denied_capability_accepts_snake_case_reason_code() -> None:
     assert decision.reason_code == "stable_reason_2"
 
 
-def test_default_catalog_declares_target_markets_without_claiming_live() -> None:
+def test_default_catalog_v2_adds_spot_only_bitget_without_claiming_live() -> None:
     snapshot = default_catalog_snapshot()
 
     assert default_catalog_snapshot() is snapshot
-    assert snapshot.revision_id == "builtin-market-catalog-v1"
+    assert snapshot.revision_id == "builtin-market-catalog-v2"
     assert len(snapshot.catalog.products) == 20
     assert len(snapshot.product_policies) == 20
     assert {market.market_id for market in snapshot.catalog.markets} == {
@@ -265,6 +265,24 @@ def test_default_catalog_declares_target_markets_without_claiming_live() -> None
         MarketType.HK_STOCK,
         MarketType.US_STOCK,
     }
+    bitget = next(venue for venue in snapshot.catalog.venues if venue.venue_id == "bitget")
+    assert bitget.status is CatalogStatus.ACTIVE
+    assert bitget.product_ids == (ProductType.SPOT,)
+    assert (
+        snapshot.capability(
+            MarketType.DIGITAL_ASSET,
+            ProductType.SPOT,
+            CapabilityName.PAPER_TRADING,
+        ).allowed
+        is True
+    )
+    spot_live = snapshot.capability(
+        MarketType.DIGITAL_ASSET,
+        ProductType.SPOT,
+        CapabilityName.LIVE_TRADING,
+    )
+    assert spot_live.allowed is False
+    assert spot_live.reason_code == "live_lane_not_enabled"
     assert (
         snapshot.capability(
             MarketType.DIGITAL_ASSET,

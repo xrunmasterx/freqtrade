@@ -84,13 +84,18 @@ def test_catalog_v2_returns_the_immutable_default_snapshot(catalog_client) -> No
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["revision_id"] == "builtin-market-catalog-v1"
+    assert payload["revision_id"] == "builtin-market-catalog-v2"
     assert {market["market_id"] for market in payload["catalog"]["markets"]} == {
         "digital_asset",
         "a_share",
         "hk_stock",
         "us_stock",
     }
+    bitget = next(
+        venue for venue in payload["catalog"]["venues"] if venue["venue_id"] == "bitget"
+    )
+    assert bitget["status"] == "active"
+    assert bitget["product_ids"] == ["spot"]
 
 
 def test_catalog_v2_lists_products_and_rejects_unknown_market(catalog_client) -> None:

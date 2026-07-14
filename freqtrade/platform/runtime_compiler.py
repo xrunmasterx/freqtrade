@@ -362,11 +362,16 @@ class RuntimeSpecCompiler:
         safety = request.safety_policy_identity
         components = request.component_commits
         expected_dry_run = request.environment == "paper"
+        expected_strategy_commit = (
+            components.root_commit
+            if request.owner_ref.owner_kind is RuntimeOwnerKind.PAPER_PROBE
+            else components.strategies_commit
+        )
         if (
             config.market_scope != request.market_scope
             or config.commit != components.root_commit
             or safety.commit != components.root_commit
-            or strategy.commit != components.strategies_commit
+            or strategy.commit != expected_strategy_commit
             or config.dry_run is not safety.dry_run
             or config.dry_run is not expected_dry_run
         ):

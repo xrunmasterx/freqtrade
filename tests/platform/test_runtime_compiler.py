@@ -268,7 +268,7 @@ def _request_values() -> dict[str, object]:
             "dry_run": True,
         },
         "strategy_identity": {
-            "commit": STRATEGIES_COMMIT,
+            "commit": ROOT_COMMIT,
             "digest": "c" * 64,
             "strategy_class_name": "SampleStrategy",
         },
@@ -401,14 +401,14 @@ def test_compile_has_literal_golden_canonical_json_and_digest() -> None:
         '"state_allocation_id":"state-paper-probe-v1",'
         '"state_layout_id":"freqtrade-state-v1",'
         '"strategies_commit":"4444444444444444444444444444444444444444",'
-        '"strategy_commit":"4444444444444444444444444444444444444444",'
+        '"strategy_commit":"1111111111111111111111111111111111111111",'
         '"strategy_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
         '"template_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
     )
 
     assert revision.canonical_payload == expected_payload
     assert revision.payload_digest == (
-        "5224b382ab312fe4a328ea49d65d641914cceb543c7f673b32fae183ec7bb45e"
+        "0ce1ba3432199a37ffb568564b43b9703e8f6c44f3ab23e00595b6d69b016167"
     )
     assert revision.runtime_spec_revision_id == f"runtime-spec-{revision.payload_digest}"
 
@@ -424,6 +424,49 @@ def test_reordered_secret_inputs_compile_to_identical_revision() -> None:
     )
 
     assert second == first
+
+
+def test_paper_probe_rejects_sample_strategy_bound_to_strategies_component() -> None:
+    values = _request_values()
+    strategy_identity = values["strategy_identity"]
+    assert isinstance(strategy_identity, dict)
+    strategy_identity["commit"] = STRATEGIES_COMMIT
+
+    with pytest.raises(RuntimeCompileError, match=r"^runtime_artifacts_invalid$"):
+        _compiler().compile(values)
+
+
+def test_workspace_worker_strategy_remains_bound_to_strategies_component() -> None:
+    owner = RuntimeOwnerRef(
+        owner_kind=RuntimeOwnerKind.WORKSPACE_WORKER,
+        owner_id="research-worker",
+        owner_revision="research-worker-v1",
+    )
+    template_revision = _revision_for_template(
+        _template_revision().template.model_copy(
+            update={"allowed_owner_kinds": (RuntimeOwnerKind.WORKSPACE_WORKER,)}
+        )
+    )
+    secret_references = tuple(
+        reference.model_copy(update={"owner_scope": owner})
+        for reference in _secret_references()
+    )
+    values = _request_values()
+    values["owner_ref"] = owner.model_dump(mode="json")
+    values["adapter_template_revision_id"] = template_revision.revision_id
+    strategy_identity = values["strategy_identity"]
+    assert isinstance(strategy_identity, dict)
+    strategy_identity["commit"] = STRATEGIES_COMMIT
+    compiler = _compiler(
+        template_revision=template_revision,
+        secret_references=secret_references,
+    )
+
+    compiler.compile(values)
+
+    strategy_identity["commit"] = ROOT_COMMIT
+    with pytest.raises(RuntimeCompileError, match=r"^runtime_artifacts_invalid$"):
+        compiler.compile(values)
 
 
 @pytest.mark.parametrize(
