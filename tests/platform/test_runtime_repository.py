@@ -163,6 +163,7 @@ def _seed_runtime_parent_chain(session: Session) -> None:
             ),
         )
     )
+    session.flush()
 
 
 def _seed_instance(engine: Engine, instance_id: str = "instance-1", **updates: object) -> None:
