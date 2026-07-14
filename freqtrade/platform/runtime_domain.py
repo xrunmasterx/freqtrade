@@ -63,6 +63,7 @@ class RuntimeAuditAction(StrEnum):
     PUBLISH_TEMPLATE = "publish_template"
     DEPRECATE_TEMPLATE = "deprecate_template"
     REVOKE_TEMPLATE = "revoke_template"
+    REGISTER_PAPER_PROBE = "register_paper_probe"
 
 
 class RuntimeJobStatus(StrEnum):

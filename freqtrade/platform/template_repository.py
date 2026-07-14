@@ -2,7 +2,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
 from uuid import uuid4
 
 from pydantic import (
@@ -13,7 +13,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -45,6 +45,33 @@ class TemplateDataError(RuntimeError):
 
 class TemplateInvalidTransition(RuntimeError):
     pass
+
+
+class TemplateTransactionLock(Protocol):
+    def acquire(self, session: Session, revision_id: Identifier) -> None: ...
+
+
+class PostgresTemplateTransactionLock:
+    def acquire(self, session: Session, revision_id: Identifier) -> None:
+        digest = hashlib.sha256(f"adapter-template:{revision_id}".encode()).digest()
+        lock_key = int.from_bytes(digest[:8], byteorder="big", signed=True)
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": lock_key},
+        )
+
+
+class SqliteNoOpTemplateTransactionLock:
+    def acquire(self, session: Session, revision_id: Identifier) -> None:
+        del session, revision_id
+
+
+def template_transaction_lock_for(engine: Engine) -> TemplateTransactionLock:
+    if engine.dialect.name == "postgresql":
+        return PostgresTemplateTransactionLock()
+    if engine.dialect.name == "sqlite":
+        return SqliteNoOpTemplateTransactionLock()
+    raise ValueError("unsupported_platform_database")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -223,10 +250,52 @@ def _stored_required_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def template_revision_view(
+    record: AdapterTemplateRevisionRecord,
+) -> AdapterTemplateRevisionView:
+    try:
+        template = _decode_template_payload(record.canonical_payload)
+        publication = CommittedTemplatePublication.model_validate(
+            {
+                "template": template.model_dump(mode="python"),
+                "canonical_payload": record.canonical_payload,
+                "payload_digest": record.payload_digest,
+                "source_commit": record.source_commit,
+                "root_commit": record.root_commit,
+                "backend_commit": record.backend_commit,
+                "frontend_commit": record.frontend_commit,
+                "strategies_commit": record.strategies_commit,
+            }
+        )
+        if (
+            publication.template.template_id != record.template_id
+            or publication.template.semantic_version != record.semantic_version
+        ):
+            raise ValueError("template_record_identity_mismatch")
+        return AdapterTemplateRevisionView(
+            revision_id=record.adapter_template_revision_id,
+            template=publication.template,
+            payload_digest=publication.payload_digest,
+            source_commit=publication.source_commit,
+            root_commit=publication.root_commit,
+            backend_commit=publication.backend_commit,
+            frontend_commit=publication.frontend_commit,
+            strategies_commit=publication.strategies_commit,
+            status=TemplateStatus(record.status),
+            published_by=record.published_by,
+            published_at=_stored_required_utc(record.published_at),
+            deprecated_at=_stored_utc(record.deprecated_at),
+            revoked_at=_stored_utc(record.revoked_at),
+        )
+    except (ValidationError, ValueError):
+        raise TemplateDataError("invalid_template_revision_data") from None
+
+
 class SqlTemplateRepository:
     def __init__(self, engine: Engine, id_factory: IdFactory = _uuid_id) -> None:
         self._engine = engine
         self._id_factory = id_factory
+        self._transaction_lock = template_transaction_lock_for(engine)
 
     def publish_template(
         self,
@@ -338,6 +407,7 @@ class SqlTemplateRepository:
         validated_revision_id = _IDENTIFIER_ADAPTER.validate_python(revision_id)
         validated_actor = _IDENTIFIER_ADAPTER.validate_python(actor)
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            self._transaction_lock.acquire(session, validated_revision_id)
             record = session.scalar(
                 select(AdapterTemplateRevisionRecord)
                 .where(
@@ -459,39 +529,4 @@ class SqlTemplateRepository:
 
     @staticmethod
     def _view(record: AdapterTemplateRevisionRecord) -> AdapterTemplateRevisionView:
-        try:
-            template = _decode_template_payload(record.canonical_payload)
-            publication = CommittedTemplatePublication.model_validate(
-                {
-                    "template": template.model_dump(mode="python"),
-                    "canonical_payload": record.canonical_payload,
-                    "payload_digest": record.payload_digest,
-                    "source_commit": record.source_commit,
-                    "root_commit": record.root_commit,
-                    "backend_commit": record.backend_commit,
-                    "frontend_commit": record.frontend_commit,
-                    "strategies_commit": record.strategies_commit,
-                }
-            )
-            if (
-                publication.template.template_id != record.template_id
-                or publication.template.semantic_version != record.semantic_version
-            ):
-                raise ValueError("template_record_identity_mismatch")
-            return AdapterTemplateRevisionView(
-                revision_id=record.adapter_template_revision_id,
-                template=publication.template,
-                payload_digest=publication.payload_digest,
-                source_commit=publication.source_commit,
-                root_commit=publication.root_commit,
-                backend_commit=publication.backend_commit,
-                frontend_commit=publication.frontend_commit,
-                strategies_commit=publication.strategies_commit,
-                status=TemplateStatus(record.status),
-                published_by=record.published_by,
-                published_at=_stored_required_utc(record.published_at),
-                deprecated_at=_stored_utc(record.deprecated_at),
-                revoked_at=_stored_utc(record.revoked_at),
-            )
-        except (ValidationError, ValueError):
-            raise TemplateDataError("invalid_template_revision_data") from None
+        return template_revision_view(record)

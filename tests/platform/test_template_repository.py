@@ -682,6 +682,7 @@ def test_runtime_lifecycle_actions_remain_closed_to_template_audit_actions() -> 
         "publish_template",
         "deprecate_template",
         "revoke_template",
+        "register_paper_probe",
     )
     with pytest.raises(ValueError):
         RuntimeAction("publish_template")

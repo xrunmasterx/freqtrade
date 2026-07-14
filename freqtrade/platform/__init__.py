@@ -25,6 +25,16 @@ from freqtrade.platform.runtime_domain import (
     RuntimeOwnerKind,
     RuntimeOwnerRef,
 )
+from freqtrade.platform.runtime_registration import (
+    EnsurePaperProbeRegistrationRequest,
+    PaperProbeRegistrationResult,
+    PaperProbeRegistrationStatus,
+)
+from freqtrade.platform.runtime_registration_repository import (
+    PaperProbeRegistrationConflict,
+    PaperProbeRegistrationNotFound,
+    SqlPaperProbeRegistrationRepository,
+)
 from freqtrade.platform.runtime_repository import (
     RuntimeAuditEvent,
     RuntimeConflict,
@@ -36,7 +46,10 @@ from freqtrade.platform.runtime_repository import (
     RuntimeRepository,
     SqlRuntimeRepository,
 )
-from freqtrade.platform.runtime_service import RuntimeApplicationService
+from freqtrade.platform.runtime_service import (
+    RuntimeApplicationService,
+    RuntimeServiceConfigurationError,
+)
 from freqtrade.platform.runtime_spec import (
     RuntimeMarketScope,
     RuntimeSpecPayload,
@@ -68,9 +81,14 @@ __all__ = [
     "AdapterTemplateRevisionView",
     "CatalogRepository",
     "CommittedTemplatePublication",
+    "EnsurePaperProbeRegistrationRequest",
     "FrozenPlatformModel",
     "PlatformBase",
     "PlatformDatabaseSettings",
+    "PaperProbeRegistrationConflict",
+    "PaperProbeRegistrationNotFound",
+    "PaperProbeRegistrationResult",
+    "PaperProbeRegistrationStatus",
     "RuntimeAction",
     "RuntimeAuditAction",
     "RuntimeApplicationService",
@@ -96,9 +114,11 @@ __all__ = [
     "RuntimeMarketScope",
     "RuntimeSpecPayload",
     "RuntimeSpecRevision",
+    "RuntimeServiceConfigurationError",
     "SecretReference",
     "SecretReferenceStatus",
     "SqlCatalogRepository",
+    "SqlPaperProbeRegistrationRepository",
     "SqlRuntimeRepository",
     "SqlTemplateRepository",
     "StateAllocation",

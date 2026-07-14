@@ -10,6 +10,7 @@ import pytest
 import sqlalchemy
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -23,6 +24,7 @@ from sqlalchemy import (
     create_engine,
     insert,
     inspect,
+    select,
 )
 from sqlalchemy.exc import IntegrityError
 
@@ -41,6 +43,9 @@ from tests.platform.postgres_test_support import (
 BACKEND_ROOT = Path(__file__).parents[2]
 ALEMBIC_CONFIG_PATH = BACKEND_ROOT / "alembic-platform.ini"
 MIGRATIONS_ROOT = BACKEND_ROOT / "platform_migrations"
+REGISTRATION_MIGRATION_PATH = (
+    MIGRATIONS_ROOT / "versions" / "20260714_0004_runtime_registration.py"
+)
 
 EXPECTED_COLUMNS = {
     "platform_catalog_revisions": {
@@ -1195,3 +1200,105 @@ def test_alembic_head_has_no_orm_drift(postgres_url: str) -> None:
     command.upgrade(config, "head")
 
     command.check(config)
+
+
+def test_runtime_registration_migration_is_linear_and_single_head() -> None:
+    migration = runpy.run_path(str(REGISTRATION_MIGRATION_PATH))
+
+    assert migration["revision"] == "20260714_0004"
+    assert migration["down_revision"] == "20260714_0003"
+    assert ScriptDirectory.from_config(Config(str(ALEMBIC_CONFIG_PATH))).get_heads() == [
+        "20260714_0004"
+    ]
+
+
+@pytest.mark.parametrize(
+    "starting_revision",
+    ["20260712_0001", "20260712_0002", "20260714_0003", "head"],
+)
+def test_registration_migration_upgrades_supported_postgres_fixtures(
+    postgres_url: str,
+    starting_revision: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, starting_revision)
+    command.upgrade(config, "head")
+    engine = create_engine(postgres_url)
+    try:
+        with engine.connect() as connection:
+            version = connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one()
+            assert version == "20260714_0004"
+    finally:
+        engine.dispose()
+
+
+def _registration_audit_values() -> dict[str, object]:
+    return {
+        "audit_event_id": "audit-register-phase2-spot-paper-probe",
+        "actor_type": "operator_cli",
+        "request_id": "request-register-phase2-spot-paper-probe",
+        "idempotency_key": None,
+        "owner_kind": "paper_probe",
+        "owner_id": "phase2-spot-paper-probe",
+        "owner_revision": "phase2-spot-paper-probe-v1",
+        "instance_id": None,
+        "runtime_spec_revision_id": None,
+        "adapter_template_revision_id": None,
+        "action": "register_paper_probe",
+        "previous_state": None,
+        "next_state": {"lifecycle_status": "registered"},
+        "result_code": "registered",
+        "occurred_at": datetime(2026, 7, 14, tzinfo=UTC),
+        "provenance": {"source": "runtime_registration_repository"},
+    }
+
+
+def test_registration_migration_empty_downgrade_restores_0003_constraint(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "20260714_0003")
+    engine = create_engine(postgres_url)
+    metadata = MetaData()
+    audit = Table("runtime_audit_events", metadata, autoload_with=engine)
+    try:
+        with engine.connect() as connection:
+            version = connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one()
+            assert version == "20260714_0003"
+        _expect_integrity_error(engine, audit, _registration_audit_values())
+    finally:
+        engine.dispose()
+
+
+def test_registration_migration_refuses_populated_downgrade_and_preserves_audit(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    engine = create_engine(postgres_url)
+    metadata = MetaData()
+    audit = Table("runtime_audit_events", metadata, autoload_with=engine)
+    try:
+        with engine.begin() as connection:
+            connection.execute(insert(audit).values(**_registration_audit_values()))
+
+        with pytest.raises(sqlalchemy.exc.DBAPIError, match="registration_audit_downgrade_refused"):
+            command.downgrade(config, "20260714_0003")
+
+        with engine.connect() as connection:
+            version = connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one()
+            assert version == "20260714_0004"
+            assert connection.execute(
+                select(audit.c.action).where(
+                    audit.c.audit_event_id == "audit-register-phase2-spot-paper-probe"
+                )
+            ).scalar_one() == "register_paper_probe"
+    finally:
+        engine.dispose()
