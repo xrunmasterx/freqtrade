@@ -147,20 +147,23 @@ def _seed_runtime_parent_chain(session: Session) -> None:
                 ready_at=NOW,
                 retired_at=None,
             ),
-            RuntimeSpecRevisionRecord(
-                runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
-                owner_kind="paper_probe",
-                owner_id="owner-1",
-                owner_revision="owner-revision-1",
-                instance_kind="execution_worker",
-                catalog_revision_id="catalog-revision-1",
-                environment="paper",
-                adapter_template_revision_id="adapter-template-1",
-                state_allocation_id="state-allocation-1",
-                canonical_payload="{}",
-                payload_digest=RUNTIME_SPEC_PAYLOAD_DIGEST,
-                created_at=NOW,
-            ),
+        )
+    )
+    session.flush()
+    session.add(
+        RuntimeSpecRevisionRecord(
+            runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
+            owner_kind="paper_probe",
+            owner_id="owner-1",
+            owner_revision="owner-revision-1",
+            instance_kind="execution_worker",
+            catalog_revision_id="catalog-revision-1",
+            environment="paper",
+            adapter_template_revision_id="adapter-template-1",
+            state_allocation_id="state-allocation-1",
+            canonical_payload="{}",
+            payload_digest=RUNTIME_SPEC_PAYLOAD_DIGEST,
+            created_at=NOW,
         )
     )
     session.flush()
