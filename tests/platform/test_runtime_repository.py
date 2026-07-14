@@ -10,6 +10,7 @@ from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
 import freqtrade.platform as platform
+from freqtrade.platform.catalog_repository import CatalogRevisionRecord
 from freqtrade.platform.database import PlatformBase
 from freqtrade.platform.runtime_domain import RuntimeAction, RuntimeLifecycleCommand
 from freqtrade.platform.runtime_models import (
@@ -30,11 +31,18 @@ from freqtrade.platform.runtime_repository import (
     RuntimeRepository,
     SqlRuntimeRepository,
 )
+from freqtrade.platform.template_models import (
+    AdapterTemplateRevisionRecord,
+    RuntimeSpecRevisionRecord,
+    StateAllocationRecord,
+)
 
 
 BACKEND_ROOT = Path(__file__).parents[2]
 ALEMBIC_CONFIG_PATH = BACKEND_ROOT / "alembic-platform.ini"
 NOW = datetime(2026, 7, 12, 8, tzinfo=UTC)
+RUNTIME_SPEC_PAYLOAD_DIGEST = "b" * 64
+RUNTIME_SPEC_REVISION_ID = f"runtime-spec-{RUNTIME_SPEC_PAYLOAD_DIGEST}"
 
 
 class MutableClock:
@@ -97,6 +105,66 @@ def postgres_repository(
     return SqlRuntimeRepository(postgres_engine, clock=clock, id_factory=SequentialIds())
 
 
+def _seed_runtime_parent_chain(session: Session) -> None:
+    if session.get(RuntimeSpecRevisionRecord, RUNTIME_SPEC_REVISION_ID) is not None:
+        return
+
+    session.add_all(
+        (
+            CatalogRevisionRecord(
+                revision_id="catalog-revision-1",
+                payload={"schema_version": 1},
+                created_at=NOW,
+            ),
+            AdapterTemplateRevisionRecord(
+                adapter_template_revision_id="adapter-template-1",
+                template_id="adapter-template-1",
+                semantic_version="1.0.0",
+                canonical_payload="{}",
+                payload_digest="a" * 64,
+                source_commit="1" * 40,
+                root_commit="1" * 40,
+                backend_commit="2" * 40,
+                frontend_commit="3" * 40,
+                strategies_commit="4" * 40,
+                status="active",
+                published_by="platform-test",
+                published_at=NOW,
+                deprecated_at=None,
+                revoked_at=None,
+            ),
+            StateAllocationRecord(
+                state_allocation_id="state-allocation-1",
+                instance_id="fixture-parent-instance",
+                layout_id="fixture-layout-1",
+                provider_id="managed-local-v1",
+                relative_path="ft_userdata/runtime/instances/fixture-parent-instance",
+                kind="fresh",
+                status="ready",
+                generation=1,
+                restore_source_bundle_id=None,
+                created_at=NOW,
+                ready_at=NOW,
+                retired_at=None,
+            ),
+            RuntimeSpecRevisionRecord(
+                runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
+                owner_kind="paper_probe",
+                owner_id="owner-1",
+                owner_revision="owner-revision-1",
+                instance_kind="execution_worker",
+                catalog_revision_id="catalog-revision-1",
+                environment="paper",
+                adapter_template_revision_id="adapter-template-1",
+                state_allocation_id="state-allocation-1",
+                canonical_payload="{}",
+                payload_digest=RUNTIME_SPEC_PAYLOAD_DIGEST,
+                created_at=NOW,
+            ),
+        )
+    )
+
+
 def _seed_instance(engine: Engine, instance_id: str = "instance-1", **updates: object) -> None:
     values: dict[str, object] = {
         "instance_id": instance_id,
@@ -105,7 +173,7 @@ def _seed_instance(engine: Engine, instance_id: str = "instance-1", **updates: o
         "owner_id": "owner-1",
         "owner_revision": "owner-revision-1",
         "management_mode": "supervisor",
-        "runtime_spec_revision_id": "runtime-spec-1",
+        "runtime_spec_revision_id": RUNTIME_SPEC_REVISION_ID,
         "environment": "paper",
         "state_allocation_id": "state-allocation-1",
         "desired_state": "stopped",
@@ -117,6 +185,7 @@ def _seed_instance(engine: Engine, instance_id: str = "instance-1", **updates: o
     }
     values.update(updates)
     with Session(engine) as session, session.begin():
+        _seed_runtime_parent_chain(session)
         session.add(RuntimeInstanceRecord(**values))
 
 
@@ -130,7 +199,7 @@ def _seed_attempt(
         "attempt_id": attempt_id,
         "instance_id": instance_id,
         "attempt_number": 1,
-        "runtime_spec_revision_id": "runtime-spec-1",
+        "runtime_spec_revision_id": RUNTIME_SPEC_REVISION_ID,
         "adapter_template_revision_id": "adapter-template-1",
         "resolved_secret_versions": {"exchange": "version-1"},
         "image_id": "sha256:image-1",
@@ -828,7 +897,7 @@ def test_append_audit_accepts_only_closed_non_secret_input(
         owner_id="owner-1",
         owner_revision="owner-revision-1",
         instance_id="instance-1",
-        runtime_spec_revision_id="runtime-spec-1",
+        runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
         adapter_template_revision_id=None,
         action="start",
         previous_state=state,

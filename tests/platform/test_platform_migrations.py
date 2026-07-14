@@ -149,6 +149,13 @@ EXPECTED_COLUMNS = {
 
 EXPECTED_TABLES = set(EXPECTED_COLUMNS)
 RUNTIME_TABLES = EXPECTED_TABLES - {"platform_catalog_revisions"}
+RUNTIME_PARENT_TABLES = {
+    "adapter_template_revisions",
+    "runtime_spec_revisions",
+    "state_allocations",
+}
+RUNTIME_SPEC_PAYLOAD_DIGEST = "b" * 64
+RUNTIME_SPEC_REVISION_ID = f"runtime-spec-{RUNTIME_SPEC_PAYLOAD_DIGEST}"
 EXPECTED_NULLABLE_COLUMNS = {
     "platform_catalog_revisions": set(),
     "runtime_instances": {"retired_at"},
@@ -279,8 +286,30 @@ EXPECTED_DATETIME_COLUMNS = {
     "runtime_audit_events": {"occurred_at"},
 }
 EXPECTED_FOREIGN_KEYS = {
+    "runtime_instances": {
+        (
+            "fk_runtime_instances_runtime_spec_revision_id",
+            ("runtime_spec_revision_id",),
+            "runtime_spec_revisions",
+        ),
+        (
+            "fk_runtime_instances_state_allocation_id",
+            ("state_allocation_id",),
+            "state_allocations",
+        ),
+    },
     "runtime_attempts": {
-        ("fk_runtime_attempts_instance_id", ("instance_id",), "runtime_instances")
+        ("fk_runtime_attempts_instance_id", ("instance_id",), "runtime_instances"),
+        (
+            "fk_runtime_attempts_runtime_spec_revision_id",
+            ("runtime_spec_revision_id",),
+            "runtime_spec_revisions",
+        ),
+        (
+            "fk_runtime_attempts_adapter_template_revision_id",
+            ("adapter_template_revision_id",),
+            "adapter_template_revisions",
+        ),
     },
     "runtime_lifecycle_jobs": {
         ("fk_runtime_lifecycle_jobs_instance_id", ("instance_id",), "runtime_instances")
@@ -294,7 +323,17 @@ EXPECTED_FOREIGN_KEYS = {
         ("fk_runtime_access_requests_attempt_id", ("attempt_id",), "runtime_attempts"),
     },
     "runtime_audit_events": {
-        ("fk_runtime_audit_events_instance_id", ("instance_id",), "runtime_instances")
+        ("fk_runtime_audit_events_instance_id", ("instance_id",), "runtime_instances"),
+        (
+            "fk_runtime_audit_events_runtime_spec_revision_id",
+            ("runtime_spec_revision_id",),
+            "runtime_spec_revisions",
+        ),
+        (
+            "fk_runtime_audit_events_adapter_template_revision_id",
+            ("adapter_template_revision_id",),
+            "adapter_template_revisions",
+        ),
     },
 }
 
@@ -348,7 +387,69 @@ def _load_tables(postgres_url: str) -> tuple[Engine, dict[str, Table]]:
     engine = create_engine(postgres_url)
     metadata = MetaData()
     metadata.reflect(bind=engine)
-    return engine, {name: metadata.tables[name] for name in EXPECTED_TABLES}
+    table_names = EXPECTED_TABLES | RUNTIME_PARENT_TABLES
+    return engine, {name: metadata.tables[name] for name in table_names}
+
+
+def _seed_runtime_parent_chain(connection: sqlalchemy.Connection, tables: dict[str, Table]) -> None:
+    connection.execute(
+        insert(tables["platform_catalog_revisions"]).values(
+            revision_id="catalog-revision-1",
+            payload={"schema_version": 1},
+            created_at=datetime(2026, 7, 12, tzinfo=UTC),
+        )
+    )
+    connection.execute(
+        insert(tables["adapter_template_revisions"]).values(
+            adapter_template_revision_id="adapter-template-1",
+            template_id="adapter-template-1",
+            semantic_version="1.0.0",
+            canonical_payload="{}",
+            payload_digest="a" * 64,
+            source_commit="1" * 40,
+            root_commit="1" * 40,
+            backend_commit="2" * 40,
+            frontend_commit="3" * 40,
+            strategies_commit="4" * 40,
+            status="active",
+            published_by="platform-test",
+            published_at=datetime(2026, 7, 12, tzinfo=UTC),
+            deprecated_at=None,
+            revoked_at=None,
+        )
+    )
+    connection.execute(
+        insert(tables["state_allocations"]).values(
+            state_allocation_id="state-allocation-1",
+            instance_id="fixture-parent-instance",
+            layout_id="fixture-layout-1",
+            provider_id="managed-local-v1",
+            relative_path="ft_userdata/runtime/instances/fixture-parent-instance",
+            kind="fresh",
+            status="ready",
+            generation=1,
+            restore_source_bundle_id=None,
+            created_at=datetime(2026, 7, 12, tzinfo=UTC),
+            ready_at=datetime(2026, 7, 12, tzinfo=UTC),
+            retired_at=None,
+        )
+    )
+    connection.execute(
+        insert(tables["runtime_spec_revisions"]).values(
+            runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
+            owner_kind="paper_probe",
+            owner_id="owner-1",
+            owner_revision="owner-revision-1",
+            instance_kind="execution_worker",
+            catalog_revision_id="catalog-revision-1",
+            environment="paper",
+            adapter_template_revision_id="adapter-template-1",
+            state_allocation_id="state-allocation-1",
+            canonical_payload="{}",
+            payload_digest=RUNTIME_SPEC_PAYLOAD_DIGEST,
+            created_at=datetime(2026, 7, 12, tzinfo=UTC),
+        )
+    )
 
 
 def _instance_values(instance_id: str = "instance-1", **updates: object) -> dict[str, object]:
@@ -359,7 +460,7 @@ def _instance_values(instance_id: str = "instance-1", **updates: object) -> dict
         "owner_id": "owner-1",
         "owner_revision": "owner-revision-1",
         "management_mode": "supervisor",
-        "runtime_spec_revision_id": "runtime-spec-1",
+        "runtime_spec_revision_id": RUNTIME_SPEC_REVISION_ID,
         "environment": "paper",
         "state_allocation_id": "state-allocation-1",
         "desired_state": "stopped",
@@ -378,7 +479,7 @@ def _attempt_values(attempt_id: str = "attempt-1", **updates: object) -> dict[st
         "attempt_id": attempt_id,
         "instance_id": "instance-1",
         "attempt_number": 1,
-        "runtime_spec_revision_id": "runtime-spec-1",
+        "runtime_spec_revision_id": RUNTIME_SPEC_REVISION_ID,
         "adapter_template_revision_id": "adapter-template-1",
         "resolved_secret_versions": {"exchange": "secret-version-1"},
         "image_id": "sha256:image-1",
@@ -728,7 +829,7 @@ def test_test_url_fallback_upgrade_commits_registry_head(postgres_url: str) -> N
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260712_0002"
+                == "20260714_0004"
             )
     finally:
         engine.dispose()
@@ -842,7 +943,7 @@ def test_caller_search_path_cannot_redirect_migration_state(postgres_url: str) -
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM public.alembic_version"
             ).scalar_one()
-        assert version == "20260712_0002"
+        assert version == "20260714_0004"
     finally:
         with engine.begin() as connection:
             connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {shadow_schema} CASCADE")
@@ -1026,6 +1127,9 @@ def test_registry_rejects_unknown_closed_values_and_invalid_numbers(
     command.upgrade(_alembic_config(postgres_url), "head")
     engine, tables = _load_tables(postgres_url)
     try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+
         invalid_instances = (
             _instance_values("bad-owner", owner_kind="unknown"),
             _instance_values("bad-mode", management_mode="compose"),
@@ -1085,6 +1189,7 @@ def test_registry_enforces_partial_and_ordinary_uniqueness(postgres_url: str) ->
     engine, tables = _load_tables(postgres_url)
     try:
         with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
             connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
             connection.execute(insert(tables["runtime_attempts"]).values(**_attempt_values()))
             connection.execute(insert(tables["runtime_lifecycle_jobs"]).values(**_job_values()))
@@ -1137,6 +1242,7 @@ def test_registry_enforces_restrictive_foreign_keys(postgres_url: str) -> None:
     engine, tables = _load_tables(postgres_url)
     try:
         with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
             connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
             connection.execute(insert(tables["runtime_attempts"]).values(**_attempt_values()))
             connection.execute(insert(tables["runtime_endpoints"]).values(**_endpoint_values()))
@@ -1157,6 +1263,7 @@ def test_registry_json_round_trip_contains_only_evidence_columns(postgres_url: s
     engine, tables = _load_tables(postgres_url)
     try:
         with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
             connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
             connection.execute(insert(tables["runtime_attempts"]).values(**_attempt_values()))
             connection.execute(
@@ -1169,7 +1276,7 @@ def test_registry_json_round_trip_contains_only_evidence_columns(postgres_url: s
                     owner_id="owner-1",
                     owner_revision="owner-revision-1",
                     instance_id="instance-1",
-                    runtime_spec_revision_id="runtime-spec-1",
+                    runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
                     adapter_template_revision_id="adapter-template-1",
                     action="start",
                     previous_state={"desired_state": "stopped"},
