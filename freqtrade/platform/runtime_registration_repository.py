@@ -160,6 +160,7 @@ class SqlPaperProbeRegistrationRepository:
                 validated_request.adapter_template_revision_id,
             )
             template_revision = self._active_template(session, validated_request)
+            self._transaction_lock.acquire(session, PAPER_PROBE_INSTANCE_ID)
             catalog = self._ensure_catalog(session, normalized_time)
             state_allocation, secret_references = self._ensure_inputs(
                 session,
