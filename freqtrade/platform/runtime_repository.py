@@ -4,7 +4,7 @@ from typing import Annotated, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, func, select, tuple_
 from sqlalchemy.orm import Session
 
 from freqtrade.platform.runtime_domain import (
@@ -497,13 +497,13 @@ class SqlRuntimeRepository:
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance = self._lock_job_and_instance(session, job_id)
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            self._validate_resolved_material(session, instance, validated_material)
             now = self._now()
             actor = self._require_current_lease(job, now)
             if job.requested_action not in {"start", "retry"}:
                 raise RuntimeInvalidTransition("attempt_requires_start_or_retry_job")
             if active_attempt is not None:
                 raise RuntimeInvalidTransition("active_attempt_exists")
-            self._validate_resolved_material(session, instance, validated_material)
 
             attempt_number = (
                 session.scalar(
@@ -676,6 +676,11 @@ class SqlRuntimeRepository:
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance = self._lock_job_and_instance(session, job_id)
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            adapter_template_revision_id = (
+                active_attempt.adapter_template_revision_id
+                if active_attempt is not None
+                else self._runtime_spec_template_binding(session, instance)
+            )
             now = self._now()
             self._require_current_lease(job, now)
             if job.lease_owner != validated_owner:
@@ -688,7 +693,7 @@ class SqlRuntimeRepository:
                 job,
                 instance,
                 validated_owner,
-                active_attempt.adapter_template_revision_id if active_attempt is not None else None,
+                adapter_template_revision_id,
                 state,
                 state,
                 "lease_renewed",
@@ -705,6 +710,11 @@ class SqlRuntimeRepository:
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance = self._lock_job_and_instance(session, job_id)
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            adapter_template_revision_id = (
+                self._runtime_spec_template_binding(session, instance)
+                if active_attempt is None
+                else None
+            )
             now = self._now()
             actor = self._require_current_lease(job, now)
             if active_attempt is not None:
@@ -719,7 +729,7 @@ class SqlRuntimeRepository:
                 job,
                 instance,
                 actor,
-                None,
+                adapter_template_revision_id,
                 previous_state,
                 self._audit_state(instance),
                 validated_failure_code,
@@ -833,18 +843,91 @@ class SqlRuntimeRepository:
             raise RuntimeInvalidTransition("template_mismatch")
         if material.state_allocation_id != runtime_spec.state_allocation_id:
             raise RuntimeInvalidTransition("state_allocation_mismatch")
-        SqlRuntimeRepository._validate_secret_versions(
-            session,
-            instance,
-            material,
-            runtime_spec.canonical_payload,
+        runtime_spec_payload = SqlRuntimeRepository._runtime_spec_payload(
+            runtime_spec.canonical_payload
         )
-        template = session.get(
-            AdapterTemplateRevisionRecord,
+        resolved_secret_versions = SqlRuntimeRepository._secret_version_mapping(material)
+        if set(resolved_secret_versions) != set(runtime_spec_payload.secret_reference_ids):
+            raise RuntimeInvalidTransition("secret_reference_set_mismatch")
+        template, references, versions = SqlRuntimeRepository._lock_provenance_rows(
+            session,
             material.adapter_template_revision_id,
+            resolved_secret_versions,
+        )
+        SqlRuntimeRepository._validate_locked_template(material, template)
+        SqlRuntimeRepository._validate_locked_secret_versions(
+            instance,
+            resolved_secret_versions,
+            references,
+            versions,
+        )
+
+    @staticmethod
+    def _runtime_spec_payload(canonical_payload: str) -> RuntimeSpecPayload:
+        try:
+            return RuntimeSpecPayload.model_validate_json(canonical_payload)
+        except ValidationError:
+            raise RuntimeDataError("invalid_runtime_spec_payload") from None
+
+    @staticmethod
+    def _lock_provenance_rows(
+        session: Session,
+        adapter_template_revision_id: str,
+        resolved_secret_versions: dict[str, str],
+    ) -> tuple[
+        AdapterTemplateRevisionRecord,
+        tuple[SecretReferenceRecord, ...],
+        tuple[SecretVersionMetadataRecord, ...],
+    ]:
+        template = session.scalar(
+            select(AdapterTemplateRevisionRecord)
+            .where(
+                AdapterTemplateRevisionRecord.adapter_template_revision_id
+                == adapter_template_revision_id
+            )
+            .with_for_update()
         )
         if template is None:
             raise RuntimeDataError("adapter_template_not_found")
+
+        secret_reference_ids = tuple(sorted(resolved_secret_versions))
+        references = tuple(
+            session.scalars(
+                select(SecretReferenceRecord)
+                .where(SecretReferenceRecord.secret_reference_id.in_(secret_reference_ids))
+                .order_by(SecretReferenceRecord.secret_reference_id)
+                .with_for_update()
+            )
+        )
+        if len(references) != len(secret_reference_ids):
+            raise RuntimeInvalidTransition("secret_reference_not_found")
+
+        secret_version_ids = tuple(sorted(resolved_secret_versions.items()))
+        versions = tuple(
+            session.scalars(
+                select(SecretVersionMetadataRecord)
+                .where(
+                    tuple_(
+                        SecretVersionMetadataRecord.secret_reference_id,
+                        SecretVersionMetadataRecord.version_id,
+                    ).in_(secret_version_ids)
+                )
+                .order_by(
+                    SecretVersionMetadataRecord.secret_reference_id,
+                    SecretVersionMetadataRecord.version_id,
+                )
+                .with_for_update()
+            )
+        )
+        if len(versions) != len(secret_version_ids):
+            raise RuntimeInvalidTransition("secret_version_not_found")
+        return template, references, versions
+
+    @staticmethod
+    def _validate_locked_template(
+        material: ResolvedRuntimeMaterial,
+        template: AdapterTemplateRevisionRecord,
+    ) -> None:
         if template.status == "revoked":
             raise RuntimeInvalidTransition("template_revoked")
         if (
@@ -861,23 +944,13 @@ class SqlRuntimeRepository:
             raise RuntimeInvalidTransition("component_commit_mismatch")
 
     @staticmethod
-    def _validate_secret_versions(
-        session: Session,
+    def _validate_locked_secret_versions(
         instance: RuntimeInstanceRecord,
-        material: ResolvedRuntimeMaterial,
-        canonical_runtime_spec: str,
+        resolved_secret_versions: dict[str, str],
+        references: tuple[SecretReferenceRecord, ...],
+        versions: tuple[SecretVersionMetadataRecord, ...],
     ) -> None:
-        try:
-            runtime_spec_payload = RuntimeSpecPayload.model_validate_json(canonical_runtime_spec)
-        except ValidationError:
-            raise RuntimeDataError("invalid_runtime_spec_payload") from None
-        resolved_secret_versions = SqlRuntimeRepository._secret_version_mapping(material)
-        if set(resolved_secret_versions) != set(runtime_spec_payload.secret_reference_ids):
-            raise RuntimeInvalidTransition("secret_reference_set_mismatch")
-        for secret_reference_id in sorted(runtime_spec_payload.secret_reference_ids):
-            reference = session.get(SecretReferenceRecord, secret_reference_id)
-            if reference is None:
-                raise RuntimeInvalidTransition("secret_reference_not_found")
+        for reference in references:
             if reference.status != "active":
                 raise RuntimeInvalidTransition("secret_reference_inactive")
             if (
@@ -890,14 +963,21 @@ class SqlRuntimeRepository:
                 instance.owner_revision,
             ):
                 raise RuntimeInvalidTransition("secret_reference_owner_mismatch")
-            version = session.get(
-                SecretVersionMetadataRecord,
-                (secret_reference_id, resolved_secret_versions[secret_reference_id]),
-            )
-            if version is None:
+        for version in versions:
+            if resolved_secret_versions[version.secret_reference_id] != version.version_id:
                 raise RuntimeInvalidTransition("secret_version_not_found")
             if version.status != "active":
                 raise RuntimeInvalidTransition("secret_version_inactive")
+
+    @staticmethod
+    def _runtime_spec_template_binding(
+        session: Session,
+        instance: RuntimeInstanceRecord,
+    ) -> str:
+        runtime_spec = session.get(RuntimeSpecRevisionRecord, instance.runtime_spec_revision_id)
+        if runtime_spec is None:
+            raise RuntimeDataError("runtime_spec_not_found")
+        return runtime_spec.adapter_template_revision_id
 
     @staticmethod
     def _complete_leased_job(

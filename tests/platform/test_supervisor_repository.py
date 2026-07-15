@@ -1,9 +1,16 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from threading import Event
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from pydantic import ValidationError
 from sqlalchemy import Engine, create_engine, event, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
 from freqtrade.markets.catalog import ProductType
@@ -11,7 +18,11 @@ from freqtrade.markets.instrument import MarketType
 from freqtrade.platform import runtime_service
 from freqtrade.platform.catalog_repository import CatalogRevisionRecord
 from freqtrade.platform.database import PlatformBase
-from freqtrade.platform.runtime_domain import RuntimeLifecycleCommand, RuntimeOwnerRef
+from freqtrade.platform.runtime_domain import (
+    RuntimeJobView,
+    RuntimeLifecycleCommand,
+    RuntimeOwnerRef,
+)
 from freqtrade.platform.runtime_models import (
     RuntimeAttemptRecord,
     RuntimeAuditEventRecord,
@@ -31,8 +42,11 @@ from freqtrade.platform.template_models import (
     SecretVersionMetadataRecord,
     StateAllocationRecord,
 )
+from freqtrade.platform.template_repository import SqlTemplateRepository
 
 
+BACKEND_ROOT = Path(__file__).parents[2]
+ALEMBIC_CONFIG_PATH = BACKEND_ROOT / "alembic-platform.ini"
 NOW = datetime(2026, 7, 16, 8, tzinfo=UTC)
 RUNTIME_SPEC = RuntimeSpecRevision.from_payload(
     RuntimeSpecPayload(
@@ -110,6 +124,18 @@ def engine() -> Iterator[Engine]:
     with value.begin() as connection:
         connection.exec_driver_sql("DROP INDEX uq_runtime_attempt_active")
         connection.exec_driver_sql("DROP INDEX uq_runtime_job_active")
+    try:
+        yield value
+    finally:
+        value.dispose()
+
+
+@pytest.fixture
+def postgres_engine(postgres_url: str) -> Iterator[Engine]:
+    config = Config(str(ALEMBIC_CONFIG_PATH))
+    config.set_main_option("sqlalchemy.url", postgres_url.replace("%", "%%"))
+    command.upgrade(config, "head")
+    value = create_engine(postgres_url)
     try:
         yield value
     finally:
@@ -288,43 +314,24 @@ def _resolved_secret_version_mapping(material: object) -> dict[str, str]:
 def _database_snapshot(engine: Engine) -> tuple[tuple[tuple[object, ...], ...], ...]:
     with Session(engine) as session:
         instances = session.execute(
-            select(
-                RuntimeInstanceRecord.instance_id,
-                RuntimeInstanceRecord.desired_state,
-                RuntimeInstanceRecord.lifecycle_status,
-                RuntimeInstanceRecord.failure_latched,
-                RuntimeInstanceRecord.optimistic_version,
-            ).order_by(RuntimeInstanceRecord.instance_id)
+            select(*RuntimeInstanceRecord.__table__.columns).order_by(
+                RuntimeInstanceRecord.instance_id
+            )
         )
         jobs = session.execute(
-            select(
-                RuntimeLifecycleJobRecord.job_id,
-                RuntimeLifecycleJobRecord.status,
-                RuntimeLifecycleJobRecord.lease_owner,
-                RuntimeLifecycleJobRecord.lease_expires_at,
-                RuntimeLifecycleJobRecord.completed_at,
-                RuntimeLifecycleJobRecord.failure_code,
-            ).order_by(RuntimeLifecycleJobRecord.job_id)
+            select(*RuntimeLifecycleJobRecord.__table__.columns).order_by(
+                RuntimeLifecycleJobRecord.job_id
+            )
         )
         attempts = session.execute(
-            select(
-                RuntimeAttemptRecord.attempt_id,
-                RuntimeAttemptRecord.status,
-                RuntimeAttemptRecord.health_result,
-                RuntimeAttemptRecord.stopped_at,
-                RuntimeAttemptRecord.exit_code,
-                RuntimeAttemptRecord.failure_code,
-                RuntimeAttemptRecord.resolved_secret_versions,
-                RuntimeAttemptRecord.image_id,
-            ).order_by(RuntimeAttemptRecord.attempt_id)
+            select(*RuntimeAttemptRecord.__table__.columns).order_by(
+                RuntimeAttemptRecord.attempt_id
+            )
         )
         audits = session.execute(
-            select(
-                RuntimeAuditEventRecord.audit_event_id,
-                RuntimeAuditEventRecord.result_code,
-                RuntimeAuditEventRecord.previous_state,
-                RuntimeAuditEventRecord.next_state,
-            ).order_by(RuntimeAuditEventRecord.audit_event_id)
+            select(*RuntimeAuditEventRecord.__table__.columns).order_by(
+                RuntimeAuditEventRecord.audit_event_id
+            )
         )
         return tuple(
             tuple(tuple(row) for row in result)
@@ -897,3 +904,231 @@ def test_complete_job_cannot_bypass_running_attempt_transition(
         repository.complete_job(running_job.job_id, status, failure_code)
 
     assert _database_snapshot(engine) == before
+
+
+def test_begin_attempt_locks_exact_provenance_rows_in_fixed_order(
+    monkeypatch: pytest.MonkeyPatch,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    statements: list[str] = []
+    original_scalar = Session.scalar
+    original_scalars = Session.scalars
+
+    def compile_statement(statement: object) -> None:
+        if not hasattr(statement, "compile"):
+            return
+        statements.append(
+            str(statement.compile(dialect=postgresql.dialect())).upper()
+        )
+
+    def record_scalar(
+        session: Session,
+        statement: object,
+        *args: object,
+        **kwargs: object,
+    ):
+        compile_statement(statement)
+        return original_scalar(session, statement, *args, **kwargs)
+
+    def record_scalars(
+        session: Session,
+        statement: object,
+        *args: object,
+        **kwargs: object,
+    ):
+        compile_statement(statement)
+        return original_scalars(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "scalar", record_scalar)
+    monkeypatch.setattr(Session, "scalars", record_scalars)
+
+    repository.begin_attempt(running_job.job_id, _resolved_material())
+
+    tables = (
+        "RUNTIME_LIFECYCLE_JOBS",
+        "RUNTIME_INSTANCES",
+        "RUNTIME_ATTEMPTS",
+        "ADAPTER_TEMPLATE_REVISIONS",
+        "SECRET_REFERENCES",
+        "SECRET_VERSION_METADATA",
+    )
+    locked_queries = [
+        next(
+            statement
+            for statement in statements
+            if f"FROM {table}" in statement and "FOR UPDATE" in statement
+        )
+        for table in tables
+    ]
+    indices = [statements.index(statement) for statement in locked_queries]
+    assert indices == sorted(indices)
+    assert "ORDER BY SECRET_REFERENCES.SECRET_REFERENCE_ID" in locked_queries[4]
+    assert (
+        "ORDER BY SECRET_VERSION_METADATA.SECRET_REFERENCE_ID, "
+        "SECRET_VERSION_METADATA.VERSION_ID"
+    ) in locked_queries[5]
+
+
+def test_begin_attempt_validates_lease_after_secret_version_lock(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    before = _database_snapshot(engine)
+    clock.set_sequence(NOW, NOW + timedelta(seconds=31))
+    version_query_seen = False
+
+    def consume_time_after_version_query(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        nonlocal version_query_seen
+        if not version_query_seen and "FROM secret_version_metadata" in statement:
+            version_query_seen = True
+            clock()
+
+    event.listen(engine, "after_cursor_execute", consume_time_after_version_query)
+    try:
+        with pytest.raises(RuntimeInvalidTransition, match=r"^lease_expired$"):
+            repository.begin_attempt(running_job.job_id, _resolved_material())
+    finally:
+        event.remove(engine, "after_cursor_execute", consume_time_after_version_query)
+
+    assert version_query_seen is True
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize("operation", ["renew_lease", "latch_failure"])
+def test_pre_attempt_supervisor_audit_uses_runtime_spec_template_binding(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+    operation: str,
+) -> None:
+    if operation == "renew_lease":
+        repository.renew_lease(running_job.job_id, "supervisor-1", lease_seconds=60)
+    else:
+        repository.latch_failure(running_job.job_id, "container_missing")
+
+    with Session(engine) as session:
+        audit = session.scalars(
+            select(RuntimeAuditEventRecord).order_by(
+                RuntimeAuditEventRecord.occurred_at,
+                RuntimeAuditEventRecord.audit_event_id,
+            )
+        ).all()[-1]
+    assert audit.adapter_template_revision_id == "adapter-template-1"
+
+
+def _postgres_running_repository(
+    engine: Engine,
+) -> tuple[SqlRuntimeRepository, RuntimeJobView]:
+    _seed_instance(engine)
+    repository = SqlRuntimeRepository(engine, clock=MutableClock(), id_factory=SequentialIds())
+    repository.create_job(_command("start", "start-1"), "operator_cli")
+    job = repository.claim_next_job("supervisor-1", lease_seconds=30)
+    assert job is not None
+    return repository, job
+
+
+def test_postgres_begin_waits_for_retired_version_then_rejects_without_transition_mutation(
+    postgres_engine: Engine,
+) -> None:
+    repository, running_job = _postgres_running_repository(postgres_engine)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with Session(postgres_engine) as writer, writer.begin():
+            version = writer.scalar(
+                select(SecretVersionMetadataRecord)
+                .where(
+                    SecretVersionMetadataRecord.secret_reference_id == "exchange",
+                    SecretVersionMetadataRecord.version_id == "secret-version-1",
+                )
+                .with_for_update()
+            )
+            assert version is not None
+            version.status = "retired"
+            version.retired_at = NOW
+            writer.flush()
+            future = executor.submit(
+                repository.begin_attempt,
+                running_job.job_id,
+                _resolved_material(),
+            )
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=0.2)
+
+        with pytest.raises(RuntimeInvalidTransition, match=r"^secret_version_inactive$"):
+            future.result(timeout=5)
+    finally:
+        executor.shutdown(wait=True)
+
+    assert repository.list_attempts("instance-1") == ()
+    instance = repository.get_instance("instance-1")
+    assert instance.lifecycle_status == "registered"
+    with Session(postgres_engine) as session:
+        job = session.get(RuntimeLifecycleJobRecord, running_job.job_id)
+        assert job is not None
+        assert job.status == "claimed"
+        assert session.scalar(
+            select(RuntimeAuditEventRecord).where(
+                RuntimeAuditEventRecord.result_code == "attempt_started"
+            )
+        ) is None
+
+
+def test_postgres_begin_linearizes_before_template_revoke_writer(
+    postgres_engine: Engine,
+) -> None:
+    repository, running_job = _postgres_running_repository(postgres_engine)
+    provenance_locked = Event()
+    release_begin = Event()
+
+    def pause_after_version_lock(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if "FROM secret_version_metadata" not in statement or "FOR UPDATE" not in statement:
+            return
+        provenance_locked.set()
+        if not release_begin.wait(timeout=5):
+            raise RuntimeError("timed_out_releasing_begin_attempt")
+
+    event.listen(postgres_engine, "after_cursor_execute", pause_after_version_lock)
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        begin_future = executor.submit(
+            repository.begin_attempt,
+            running_job.job_id,
+            _resolved_material(),
+        )
+        assert provenance_locked.wait(timeout=5)
+        revoke_future = executor.submit(
+            SqlTemplateRepository(postgres_engine).revoke_template,
+            "adapter-template-1",
+            "platform-admin",
+            NOW,
+        )
+        with pytest.raises(FutureTimeoutError):
+            revoke_future.result(timeout=0.2)
+
+        release_begin.set()
+        attempt = begin_future.result(timeout=5)
+        revoked = revoke_future.result(timeout=5)
+    finally:
+        release_begin.set()
+        event.remove(postgres_engine, "after_cursor_execute", pause_after_version_lock)
+        executor.shutdown(wait=True)
+
+    assert attempt.status == "launching"
+    assert revoked.status.value == "revoked"
