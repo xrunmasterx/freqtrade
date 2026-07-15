@@ -12,6 +12,7 @@ from freqtrade.platform.runtime_domain import (
     RuntimeAction,
     RuntimeAttemptStatus,
     RuntimeAttemptView,
+    RuntimeAuditAction,
     RuntimeDesiredState,
     RuntimeInstanceView,
     RuntimeJobStatus,
@@ -84,7 +85,7 @@ class RuntimeAuditEvent(_RuntimeRepositoryInput):
     instance_id: Identifier | None
     runtime_spec_revision_id: Identifier | None
     adapter_template_revision_id: Identifier | None
-    action: RuntimeAction
+    action: RuntimeAuditAction
     previous_state: RuntimeInstanceAuditState | None
     next_state: RuntimeInstanceAuditState | None
     result_code: Identifier
@@ -294,7 +295,7 @@ class SqlRuntimeRepository:
                     instance_id=instance.instance_id,
                     runtime_spec_revision_id=instance.runtime_spec_revision_id,
                     adapter_template_revision_id=None,
-                    action=command.action,
+                    action=RuntimeAuditAction(command.action.value),
                     previous_state=previous_state,
                     next_state=next_state,
                     result_code="accepted",
@@ -516,7 +517,7 @@ class SqlRuntimeRepository:
                 instance_id=instance.instance_id,
                 runtime_spec_revision_id=instance.runtime_spec_revision_id,
                 adapter_template_revision_id=None,
-                action=job.requested_action,
+                action=RuntimeAuditAction(job.requested_action),
                 previous_state=state,
                 next_state=state,
                 result_code=result_code,

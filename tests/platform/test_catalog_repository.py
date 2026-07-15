@@ -29,6 +29,10 @@ def test_static_catalog_repository_returns_the_exact_snapshot() -> None:
     repository = StaticCatalogRepository(snapshot)
 
     assert repository.current() is snapshot
+    assert repository.get(snapshot.revision_id) is snapshot
+
+    with pytest.raises(LookupError, match="market catalog revision not found"):
+        repository.get("missing-revision")
 
 
 def test_sql_catalog_repository_round_trips_an_immutable_revision() -> None:
@@ -147,12 +151,23 @@ def test_sql_catalog_repository_returns_the_latest_revision() -> None:
     _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
     first = default_catalog_snapshot()
-    second = first.model_copy(update={"revision_id": "builtin-market-catalog-v2"})
+    second = first.model_copy(update={"revision_id": "builtin-market-catalog-v3"})
 
     repository.publish(first, created_at=datetime(2026, 7, 12, 1, tzinfo=UTC))
     repository.publish(second, created_at=datetime(2026, 7, 12, 2, tzinfo=UTC))
 
     assert repository.current() == second
+    assert repository.get(first.revision_id) == first
+    assert repository.get(second.revision_id) == second
+
+
+def test_sql_catalog_repository_get_requires_an_exact_initialized_revision() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_catalog_schema(engine)
+    repository = SqlCatalogRepository(engine)
+
+    with pytest.raises(LookupError, match="market catalog revision not found"):
+        repository.get("missing-revision")
 
 
 def test_sql_catalog_repository_rejects_naive_created_at_before_opening_session(
@@ -176,7 +191,7 @@ def test_sql_catalog_repository_normalizes_offset_aware_times_before_ordering() 
     _create_catalog_schema(engine)
     repository = SqlCatalogRepository(engine)
     first = default_catalog_snapshot()
-    second = first.model_copy(update={"revision_id": "builtin-market-catalog-v2"})
+    second = first.model_copy(update={"revision_id": "builtin-market-catalog-v3"})
 
     repository.publish(
         first,

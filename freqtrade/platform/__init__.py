@@ -1,3 +1,4 @@
+from freqtrade.platform import template_models as _template_models  # noqa: F401
 from freqtrade.platform.catalog_repository import (
     CatalogRepository,
     SqlCatalogRepository,
@@ -13,6 +14,7 @@ from freqtrade.platform.runtime_domain import (
     RuntimeAction,
     RuntimeAttemptStatus,
     RuntimeAttemptView,
+    RuntimeAuditAction,
     RuntimeDesiredState,
     RuntimeInstanceView,
     RuntimeJobStatus,
@@ -22,6 +24,16 @@ from freqtrade.platform.runtime_domain import (
     RuntimeManagementMode,
     RuntimeOwnerKind,
     RuntimeOwnerRef,
+)
+from freqtrade.platform.runtime_registration import (
+    EnsurePaperProbeRegistrationRequest,
+    PaperProbeRegistrationResult,
+    PaperProbeRegistrationStatus,
+)
+from freqtrade.platform.runtime_registration_repository import (
+    PaperProbeRegistrationConflict,
+    PaperProbeRegistrationNotFound,
+    SqlPaperProbeRegistrationRepository,
 )
 from freqtrade.platform.runtime_repository import (
     RuntimeAuditEvent,
@@ -34,14 +46,51 @@ from freqtrade.platform.runtime_repository import (
     RuntimeRepository,
     SqlRuntimeRepository,
 )
-from freqtrade.platform.runtime_service import RuntimeApplicationService
+from freqtrade.platform.runtime_service import (
+    RuntimeApplicationService,
+    RuntimeServiceConfigurationError,
+)
+from freqtrade.platform.runtime_spec import (
+    RuntimeMarketScope,
+    RuntimeSpecPayload,
+    RuntimeSpecRevision,
+)
+from freqtrade.platform.template_domain import (
+    AdapterTemplate,
+    FrozenPlatformModel,
+    SecretReference,
+    SecretReferenceStatus,
+    StateAllocation,
+    StateAllocationKind,
+    StateAllocationStatus,
+    TemplateStatus,
+)
+from freqtrade.platform.template_repository import (
+    AdapterTemplateRevisionView,
+    CommittedTemplatePublication,
+    SqlTemplateRepository,
+    TemplateConflict,
+    TemplateDataError,
+    TemplateInvalidTransition,
+    TemplateNotFound,
+)
 
 
 __all__ = [
+    "AdapterTemplate",
+    "AdapterTemplateRevisionView",
     "CatalogRepository",
+    "CommittedTemplatePublication",
+    "EnsurePaperProbeRegistrationRequest",
+    "FrozenPlatformModel",
     "PlatformBase",
     "PlatformDatabaseSettings",
+    "PaperProbeRegistrationConflict",
+    "PaperProbeRegistrationNotFound",
+    "PaperProbeRegistrationResult",
+    "PaperProbeRegistrationStatus",
     "RuntimeAction",
+    "RuntimeAuditAction",
     "RuntimeApplicationService",
     "RuntimeAuditEvent",
     "RuntimeAttemptStatus",
@@ -62,9 +111,25 @@ __all__ = [
     "RuntimeOwnerRef",
     "RuntimeQueryRepository",
     "RuntimeRepository",
+    "RuntimeMarketScope",
+    "RuntimeSpecPayload",
+    "RuntimeSpecRevision",
+    "RuntimeServiceConfigurationError",
+    "SecretReference",
+    "SecretReferenceStatus",
     "SqlCatalogRepository",
+    "SqlPaperProbeRegistrationRepository",
     "SqlRuntimeRepository",
+    "SqlTemplateRepository",
+    "StateAllocation",
+    "StateAllocationKind",
+    "StateAllocationStatus",
     "StaticCatalogRepository",
+    "TemplateStatus",
+    "TemplateConflict",
+    "TemplateDataError",
+    "TemplateInvalidTransition",
+    "TemplateNotFound",
     "create_platform_engine",
     "platform_session",
 ]

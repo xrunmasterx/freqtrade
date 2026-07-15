@@ -124,7 +124,7 @@ def _products() -> tuple[ProductDefinition, ...]:
 
 
 def _venues() -> tuple[VenueDefinition, ...]:
-    return tuple(
+    venues = tuple(
         VenueDefinition(
             venue_id=venue_id,
             market_id=MarketType.DIGITAL_ASSET,
@@ -138,6 +138,16 @@ def _venues() -> tuple[VenueDefinition, ...]:
             ("bybit", "Bybit"),
             ("gate", "Gate"),
         )
+    )
+    return (
+        *venues,
+        VenueDefinition(
+            venue_id="bitget",
+            market_id=MarketType.DIGITAL_ASSET,
+            display_name="Bitget",
+            status=CatalogStatus.ACTIVE,
+            product_ids=(ProductType.SPOT,),
+        ),
     )
 
 
@@ -208,7 +218,7 @@ def _policies() -> tuple[ProductCapabilityPolicy, ...]:
 @cache
 def default_catalog_snapshot() -> CatalogSnapshot:
     return CatalogSnapshot(
-        revision_id="builtin-market-catalog-v1",
+        revision_id="builtin-market-catalog-v2",
         catalog=MarketCatalog(
             markets=_markets(),
             products=_products(),

@@ -12,12 +12,19 @@ from freqtrade.platform.database import PlatformBase
 class CatalogRepository(Protocol):
     def current(self) -> CatalogSnapshot: ...
 
+    def get(self, revision_id: str) -> CatalogSnapshot: ...
+
 
 class StaticCatalogRepository:
     def __init__(self, snapshot: CatalogSnapshot) -> None:
         self._snapshot = snapshot
 
     def current(self) -> CatalogSnapshot:
+        return self._snapshot
+
+    def get(self, revision_id: str) -> CatalogSnapshot:
+        if self._snapshot.revision_id != revision_id:
+            raise LookupError("market catalog revision not found")
         return self._snapshot
 
 
@@ -68,4 +75,11 @@ class SqlCatalogRepository:
             )
             if record is None:
                 raise LookupError("market catalog is not initialized")
+            return CatalogSnapshot.model_validate(record.payload)
+
+    def get(self, revision_id: str) -> CatalogSnapshot:
+        with Session(self._engine) as session:
+            record = session.get(CatalogRevisionRecord, revision_id)
+            if record is None:
+                raise LookupError("market catalog revision not found")
             return CatalogSnapshot.model_validate(record.payload)

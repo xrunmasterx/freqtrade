@@ -265,7 +265,9 @@ class RuntimeAuditEventRecord(PlatformBase):
             name="ck_runtime_audit_events_owner_kind",
         ),
         CheckConstraint(
-            "action IN ('start', 'stop', 'retry', 'retire')",
+            "action IN ('start', 'stop', 'retry', 'retire', "
+            "'publish_template', 'deprecate_template', 'revoke_template', "
+            "'register_paper_probe')",
             name="ck_runtime_audit_events_action",
         ),
     )
