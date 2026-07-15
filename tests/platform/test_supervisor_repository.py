@@ -1,3 +1,5 @@
+import hashlib
+import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -35,6 +37,7 @@ from freqtrade.platform.runtime_spec import (
     RuntimeSpecPayload,
     RuntimeSpecRevision,
 )
+from freqtrade.platform.template_domain import AdapterTemplate
 from freqtrade.platform.template_models import (
     AdapterTemplateRevisionRecord,
     RuntimeSpecRevisionRecord,
@@ -42,12 +45,47 @@ from freqtrade.platform.template_models import (
     SecretVersionMetadataRecord,
     StateAllocationRecord,
 )
-from freqtrade.platform.template_repository import SqlTemplateRepository
+from freqtrade.platform.template_repository import (
+    CommittedTemplatePublication,
+    SqlTemplateRepository,
+)
 
 
 BACKEND_ROOT = Path(__file__).parents[2]
 ALEMBIC_CONFIG_PATH = BACKEND_ROOT / "alembic-platform.ini"
 NOW = datetime(2026, 7, 16, 8, tzinfo=UTC)
+TEMPLATE = AdapterTemplate(
+    template_id="adapter-template-1",
+    semantic_version="1.0.0",
+    allowed_instance_kinds=("execution_worker",),
+    allowed_owner_kinds=("paper_probe",),
+    allowed_environments=("paper",),
+    image_policy_id="reviewed-image-v1",
+    command_policy_id="fixed-command-v1",
+    mount_policy_ids=("runtime-mounts-v1",),
+    network_policy_id="private-network-v1",
+    health_profile_id="api-ping-v1",
+    resource_profile_id="paper-small-v1",
+    secret_classes=("exchange_credentials",),
+    state_layout_id="fixture-layout-1",
+)
+TEMPLATE_CANONICAL_PAYLOAD = json.dumps(
+    {"schema_version": 1, **TEMPLATE.model_dump(mode="json")},
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+) + "\n"
+TEMPLATE_PUBLICATION = CommittedTemplatePublication(
+    template=TEMPLATE,
+    canonical_payload=TEMPLATE_CANONICAL_PAYLOAD,
+    payload_digest=hashlib.sha256(TEMPLATE_CANONICAL_PAYLOAD.encode()).hexdigest(),
+    source_commit="1" * 40,
+    root_commit="1" * 40,
+    backend_commit="2" * 40,
+    frontend_commit="3" * 40,
+    strategies_commit="4" * 40,
+)
+TEMPLATE_REVISION_ID = f"template-{TEMPLATE_PUBLICATION.payload_digest}"
 RUNTIME_SPEC = RuntimeSpecRevision.from_payload(
     RuntimeSpecPayload(
         owner_ref=RuntimeOwnerRef(
@@ -62,8 +100,8 @@ RUNTIME_SPEC = RuntimeSpecRevision.from_payload(
             product_ids=(ProductType.SPOT,),
         ),
         environment="paper",
-        adapter_template_revision_id="adapter-template-1",
-        template_digest="a" * 64,
+        adapter_template_revision_id=TEMPLATE_REVISION_ID,
+        template_digest=TEMPLATE_PUBLICATION.payload_digest,
         image_policy_id="reviewed-image-v1",
         command_policy_id="fixed-command-v1",
         mount_policy_ids=("runtime-mounts-v1",),
@@ -167,16 +205,16 @@ def _seed_runtime_parent_chain(session: Session) -> None:
                 created_at=NOW,
             ),
             AdapterTemplateRevisionRecord(
-                adapter_template_revision_id="adapter-template-1",
-                template_id="adapter-template-1",
-                semantic_version="1.0.0",
-                canonical_payload="{}",
-                payload_digest="a" * 64,
-                source_commit="1" * 40,
-                root_commit="1" * 40,
-                backend_commit="2" * 40,
-                frontend_commit="3" * 40,
-                strategies_commit="4" * 40,
+                adapter_template_revision_id=TEMPLATE_REVISION_ID,
+                template_id=TEMPLATE.template_id,
+                semantic_version=TEMPLATE.semantic_version,
+                canonical_payload=TEMPLATE_PUBLICATION.canonical_payload,
+                payload_digest=TEMPLATE_PUBLICATION.payload_digest,
+                source_commit=TEMPLATE_PUBLICATION.source_commit,
+                root_commit=TEMPLATE_PUBLICATION.root_commit,
+                backend_commit=TEMPLATE_PUBLICATION.backend_commit,
+                frontend_commit=TEMPLATE_PUBLICATION.frontend_commit,
+                strategies_commit=TEMPLATE_PUBLICATION.strategies_commit,
                 status="active",
                 published_by="platform-test",
                 published_at=NOW,
@@ -222,7 +260,7 @@ def _seed_runtime_parent_chain(session: Session) -> None:
                 instance_kind="execution_worker",
                 catalog_revision_id="catalog-revision-1",
                 environment="paper",
-                adapter_template_revision_id="adapter-template-1",
+                adapter_template_revision_id=TEMPLATE_REVISION_ID,
                 state_allocation_id="state-allocation-1",
                 canonical_payload=RUNTIME_SPEC.canonical_payload,
                 payload_digest=RUNTIME_SPEC_PAYLOAD_DIGEST,
@@ -287,7 +325,7 @@ def _resolved_material(
 ):
     return runtime_service.ResolvedRuntimeMaterial(
         runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
-        adapter_template_revision_id="adapter-template-1",
+        adapter_template_revision_id=TEMPLATE_REVISION_ID,
         state_allocation_id="state-allocation-1",
         resolved_secret_versions=(
             {"exchange": "secret-version-1"}
@@ -498,7 +536,7 @@ def test_begin_attempt_persists_exact_material_and_transitions_job_instance_and_
             select(RuntimeAuditEventRecord).order_by(RuntimeAuditEventRecord.occurred_at)
         ).all()[-1]
     assert audit.request_id == running_job.job_id
-    assert audit.adapter_template_revision_id == "adapter-template-1"
+    assert audit.adapter_template_revision_id == TEMPLATE_REVISION_ID
     assert audit.result_code == "attempt_started"
 
 
@@ -1023,7 +1061,7 @@ def test_pre_attempt_supervisor_audit_uses_runtime_spec_template_binding(
                 RuntimeAuditEventRecord.audit_event_id,
             )
         ).all()[-1]
-    assert audit.adapter_template_revision_id == "adapter-template-1"
+    assert audit.adapter_template_revision_id == TEMPLATE_REVISION_ID
 
 
 def _postgres_running_repository(
@@ -1035,6 +1073,19 @@ def _postgres_running_repository(
     job = repository.claim_next_job("supervisor-1", lease_seconds=30)
     assert job is not None
     return repository, job
+
+
+def test_seeded_template_revision_supports_formal_revoke_writer(engine: Engine) -> None:
+    _seed_instance(engine)
+
+    revoked = SqlTemplateRepository(engine).revoke_template(
+        TEMPLATE_REVISION_ID,
+        "platform-admin",
+        NOW,
+    )
+
+    assert revoked.revision_id == TEMPLATE_REVISION_ID
+    assert revoked.status.value == "revoked"
 
 
 def test_postgres_begin_waits_for_retired_version_then_rejects_without_transition_mutation(
@@ -1115,7 +1166,7 @@ def test_postgres_begin_linearizes_before_template_revoke_writer(
         assert provenance_locked.wait(timeout=5)
         revoke_future = executor.submit(
             SqlTemplateRepository(postgres_engine).revoke_template,
-            "adapter-template-1",
+            TEMPLATE_REVISION_ID,
             "platform-admin",
             NOW,
         )
