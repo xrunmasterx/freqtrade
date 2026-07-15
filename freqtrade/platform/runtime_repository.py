@@ -1,10 +1,10 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol, TypeVar, runtime_checkable
+from typing import Annotated, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from freqtrade.platform.runtime_domain import (
@@ -29,6 +29,10 @@ from freqtrade.platform.runtime_models import (
     RuntimeInstanceRecord,
     RuntimeLifecycleJobRecord,
 )
+from freqtrade.platform.template_models import (
+    AdapterTemplateRevisionRecord,
+    RuntimeSpecRevisionRecord,
+)
 
 
 Clock = Callable[[], datetime]
@@ -46,6 +50,8 @@ _ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
 _LEASED_JOB_STATUSES = ("claimed", "running")
 _AUDIT_SOURCE = "runtime_repository"
 _ViewT = TypeVar("_ViewT")
+_CommitIdentity = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+_ImageIdentity = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 
 
 class RuntimeNotFound(RuntimeError):
@@ -91,6 +97,20 @@ class RuntimeAuditEvent(_RuntimeRepositoryInput):
     result_code: Identifier
 
 
+class ResolvedRuntimeMaterial(_RuntimeRepositoryInput):
+    runtime_spec_revision_id: Identifier
+    adapter_template_revision_id: Identifier
+    state_allocation_id: Identifier
+    resolved_secret_versions: dict[Identifier, Identifier]
+    image_id: _ImageIdentity
+    root_commit: _CommitIdentity
+    backend_commit: _CommitIdentity
+    frontend_commit: _CommitIdentity
+    strategies_commit: _CommitIdentity
+    project_identity: Identifier
+    container_identity: Identifier
+
+
 @runtime_checkable
 class RuntimeQueryRepository(Protocol):
     def get_instance(self, instance_id: Identifier) -> RuntimeInstanceView: ...
@@ -121,6 +141,45 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         job_id: Identifier,
         status: CompletionStatus,
         failure_code: Identifier | None,
+    ) -> RuntimeJobView: ...
+
+    def begin_attempt(
+        self,
+        job_id: Identifier,
+        resolved_material: ResolvedRuntimeMaterial,
+    ) -> RuntimeAttemptView: ...
+
+    def record_healthy(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+    ) -> RuntimeAttemptView: ...
+
+    def record_failed(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        failure_code: Identifier,
+    ) -> RuntimeAttemptView: ...
+
+    def record_stopped(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        exit_code: int,
+    ) -> RuntimeAttemptView: ...
+
+    def renew_lease(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_seconds: int,
+    ) -> RuntimeJobView: ...
+
+    def latch_failure(
+        self,
+        job_id: Identifier,
+        failure_code: Identifier,
     ) -> RuntimeJobView: ...
 
     def append_audit(self, event: RuntimeAuditEvent) -> None: ...
@@ -397,9 +456,398 @@ class SqlRuntimeRepository:
             self._append_job_audit(session, job, actor, status, now)
             return self._job_view(job)
 
+    def begin_attempt(
+        self,
+        job_id: Identifier,
+        resolved_material: ResolvedRuntimeMaterial,
+    ) -> RuntimeAttemptView:
+        if not isinstance(resolved_material, ResolvedRuntimeMaterial):
+            raise RuntimeInvalidTransition("resolved_material_type_required")
+        now = self._now()
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance = self._lock_job_and_instance(session, job_id)
+            active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            actor = self._require_current_lease(job, now)
+            if job.requested_action not in {"start", "retry"}:
+                raise RuntimeInvalidTransition("attempt_requires_start_or_retry_job")
+            if active_attempt is not None:
+                raise RuntimeInvalidTransition("active_attempt_exists")
+            self._validate_resolved_material(session, instance, resolved_material)
+
+            attempt_number = (
+                session.scalar(
+                    select(func.max(RuntimeAttemptRecord.attempt_number)).where(
+                        RuntimeAttemptRecord.instance_id == instance.instance_id
+                    )
+                )
+                or 0
+            ) + 1
+            previous_state = self._audit_state(instance)
+            instance.lifecycle_status = "starting"
+            job.status = "running"
+            attempt = RuntimeAttemptRecord(
+                attempt_id=self._new_id("attempt"),
+                instance_id=instance.instance_id,
+                attempt_number=attempt_number,
+                runtime_spec_revision_id=resolved_material.runtime_spec_revision_id,
+                adapter_template_revision_id=resolved_material.adapter_template_revision_id,
+                resolved_secret_versions=dict(resolved_material.resolved_secret_versions),
+                image_id=resolved_material.image_id,
+                root_commit=resolved_material.root_commit,
+                backend_commit=resolved_material.backend_commit,
+                frontend_commit=resolved_material.frontend_commit,
+                strategies_commit=resolved_material.strategies_commit,
+                project_identity=resolved_material.project_identity,
+                container_identity=resolved_material.container_identity,
+                status="launching",
+                health_result=None,
+                started_at=now,
+                stopped_at=None,
+                exit_code=None,
+                failure_code=None,
+            )
+            session.add(attempt)
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                actor,
+                resolved_material.adapter_template_revision_id,
+                previous_state,
+                self._audit_state(instance),
+                "attempt_started",
+                now,
+            )
+            return self._attempt_view(attempt)
+
+    def record_healthy(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+    ) -> RuntimeAttemptView:
+        now = self._now()
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            actor = self._require_current_lease(job, now)
+            if job.status != "running" or job.requested_action not in {"start", "retry"}:
+                raise RuntimeInvalidTransition("healthy_requires_running_start_or_retry_job")
+            if attempt.status not in {"pending", "validating", "launching"}:
+                raise RuntimeInvalidTransition("attempt_not_health_transitionable")
+            if instance.desired_state != "running":
+                raise RuntimeInvalidTransition("healthy_requires_running_desired_state")
+
+            previous_state = self._audit_state(instance)
+            attempt.status = "healthy"
+            attempt.health_result = {"result_code": "healthy"}
+            instance.lifecycle_status = "healthy"
+            instance.failure_latched = False
+            self._complete_leased_job(job, "succeeded", None, now)
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                actor,
+                attempt.adapter_template_revision_id,
+                previous_state,
+                self._audit_state(instance),
+                "healthy",
+                now,
+            )
+            return self._attempt_view(attempt)
+
+    def record_failed(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        failure_code: Identifier,
+    ) -> RuntimeAttemptView:
+        validated_failure_code = _IDENTIFIER_ADAPTER.validate_python(failure_code)
+        now = self._now()
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            actor = self._require_current_lease(job, now)
+            if job.status != "running" or job.requested_action not in {"start", "retry"}:
+                raise RuntimeInvalidTransition("failed_requires_running_start_or_retry_job")
+            if attempt.status not in _ACTIVE_ATTEMPT_STATUSES:
+                raise RuntimeInvalidTransition("attempt_not_failure_transitionable")
+
+            previous_state = self._audit_state(instance)
+            attempt.status = "failed"
+            attempt.stopped_at = now
+            attempt.failure_code = validated_failure_code
+            instance.lifecycle_status = "failed"
+            instance.failure_latched = True
+            self._complete_leased_job(job, "failed", validated_failure_code, now)
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                actor,
+                attempt.adapter_template_revision_id,
+                previous_state,
+                self._audit_state(instance),
+                validated_failure_code,
+                now,
+            )
+            return self._attempt_view(attempt)
+
+    def record_stopped(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        exit_code: int,
+    ) -> RuntimeAttemptView:
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            raise RuntimeInvalidTransition("invalid_exit_code")
+        now = self._now()
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            actor = self._require_current_lease(job, now)
+            if job.requested_action != "stop":
+                raise RuntimeInvalidTransition("stopped_requires_stop_job")
+            if attempt.status not in _ACTIVE_ATTEMPT_STATUSES:
+                raise RuntimeInvalidTransition("attempt_not_stop_transitionable")
+            if instance.desired_state != "stopped":
+                raise RuntimeInvalidTransition("stopped_requires_stopped_desired_state")
+
+            previous_state = self._audit_state(instance)
+            attempt.status = "stopped"
+            attempt.stopped_at = now
+            attempt.exit_code = exit_code
+            instance.lifecycle_status = "stopped"
+            self._complete_leased_job(job, "succeeded", None, now)
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                actor,
+                attempt.adapter_template_revision_id,
+                previous_state,
+                self._audit_state(instance),
+                "stopped",
+                now,
+            )
+            return self._attempt_view(attempt)
+
+    def renew_lease(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_seconds: int,
+    ) -> RuntimeJobView:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise RuntimeInvalidTransition("invalid_lease_seconds")
+        now = self._now()
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance = self._lock_job_and_instance(session, job_id)
+            active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            self._require_current_lease(job, now)
+            if job.lease_owner != validated_owner:
+                raise RuntimeInvalidTransition("lease_owner_mismatch")
+
+            job.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            state = self._audit_state(instance)
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                validated_owner,
+                active_attempt.adapter_template_revision_id if active_attempt is not None else None,
+                state,
+                state,
+                "lease_renewed",
+                now,
+            )
+            return self._job_view(job)
+
+    def latch_failure(
+        self,
+        job_id: Identifier,
+        failure_code: Identifier,
+    ) -> RuntimeJobView:
+        validated_failure_code = _IDENTIFIER_ADAPTER.validate_python(failure_code)
+        now = self._now()
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance = self._lock_job_and_instance(session, job_id)
+            active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            actor = self._require_current_lease(job, now)
+
+            previous_state = self._audit_state(instance)
+            instance.lifecycle_status = "failed"
+            instance.failure_latched = True
+            self._complete_leased_job(job, "failed", validated_failure_code, now)
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                actor,
+                active_attempt.adapter_template_revision_id if active_attempt is not None else None,
+                previous_state,
+                self._audit_state(instance),
+                validated_failure_code,
+                now,
+            )
+            return self._job_view(job)
+
     def append_audit(self, event: RuntimeAuditEvent) -> None:
         with Session(self._engine) as session, session.begin():
             self._append_audit_record(session, event, self._now())
+
+    @staticmethod
+    def _lock_job_and_instance(
+        session: Session,
+        job_id: Identifier,
+    ) -> tuple[RuntimeLifecycleJobRecord, RuntimeInstanceRecord]:
+        validated_job_id = _IDENTIFIER_ADAPTER.validate_python(job_id)
+        job = session.scalar(
+            select(RuntimeLifecycleJobRecord)
+            .where(RuntimeLifecycleJobRecord.job_id == validated_job_id)
+            .with_for_update()
+        )
+        if job is None:
+            raise RuntimeNotFound("runtime_job_not_found")
+        instance = session.scalar(
+            select(RuntimeInstanceRecord)
+            .where(RuntimeInstanceRecord.instance_id == job.instance_id)
+            .with_for_update()
+        )
+        if instance is None:
+            raise RuntimeNotFound("runtime_instance_not_found")
+        return job, instance
+
+    @staticmethod
+    def _lock_active_attempt(
+        session: Session,
+        instance_id: str,
+    ) -> RuntimeAttemptRecord | None:
+        return session.scalar(
+            select(RuntimeAttemptRecord)
+            .where(
+                RuntimeAttemptRecord.instance_id == instance_id,
+                RuntimeAttemptRecord.status.in_(_ACTIVE_ATTEMPT_STATUSES),
+            )
+            .order_by(RuntimeAttemptRecord.attempt_number, RuntimeAttemptRecord.attempt_id)
+            .with_for_update()
+            .limit(1)
+        )
+
+    def _lock_transition_records(
+        self,
+        session: Session,
+        job_id: Identifier,
+        attempt_id: Identifier,
+    ) -> tuple[RuntimeLifecycleJobRecord, RuntimeInstanceRecord, RuntimeAttemptRecord]:
+        job, instance = self._lock_job_and_instance(session, job_id)
+        validated_attempt_id = _IDENTIFIER_ADAPTER.validate_python(attempt_id)
+        attempt = session.scalar(
+            select(RuntimeAttemptRecord)
+            .where(RuntimeAttemptRecord.attempt_id == validated_attempt_id)
+            .with_for_update()
+        )
+        if attempt is None:
+            raise RuntimeNotFound("runtime_attempt_not_found")
+        if attempt.instance_id != instance.instance_id:
+            raise RuntimeInvalidTransition("job_attempt_instance_mismatch")
+        return job, instance, attempt
+
+    @staticmethod
+    def _require_current_lease(job: RuntimeLifecycleJobRecord, now: datetime) -> str:
+        if job.status not in _LEASED_JOB_STATUSES:
+            raise RuntimeInvalidTransition("job_not_leased")
+        if job.lease_owner is None:
+            raise RuntimeInvalidTransition("job_lease_owner_required")
+        lease_expires_at = _aware_utc(job.lease_expires_at)
+        if lease_expires_at is None or lease_expires_at <= now:
+            raise RuntimeInvalidTransition("lease_expired")
+        return job.lease_owner
+
+    @staticmethod
+    def _validate_resolved_material(
+        session: Session,
+        instance: RuntimeInstanceRecord,
+        material: ResolvedRuntimeMaterial,
+    ) -> None:
+        if material.runtime_spec_revision_id != instance.runtime_spec_revision_id:
+            raise RuntimeInvalidTransition("runtime_spec_mismatch")
+        if material.state_allocation_id != instance.state_allocation_id:
+            raise RuntimeInvalidTransition("state_allocation_mismatch")
+        runtime_spec = session.get(RuntimeSpecRevisionRecord, instance.runtime_spec_revision_id)
+        if runtime_spec is None:
+            raise RuntimeDataError("runtime_spec_not_found")
+        if material.adapter_template_revision_id != runtime_spec.adapter_template_revision_id:
+            raise RuntimeInvalidTransition("template_mismatch")
+        if material.state_allocation_id != runtime_spec.state_allocation_id:
+            raise RuntimeInvalidTransition("state_allocation_mismatch")
+        template = session.get(
+            AdapterTemplateRevisionRecord,
+            material.adapter_template_revision_id,
+        )
+        if template is None:
+            raise RuntimeDataError("adapter_template_not_found")
+        if template.status == "revoked":
+            raise RuntimeInvalidTransition("template_revoked")
+        if (
+            material.root_commit,
+            material.backend_commit,
+            material.frontend_commit,
+            material.strategies_commit,
+        ) != (
+            template.root_commit,
+            template.backend_commit,
+            template.frontend_commit,
+            template.strategies_commit,
+        ):
+            raise RuntimeInvalidTransition("component_commit_mismatch")
+
+    @staticmethod
+    def _complete_leased_job(
+        job: RuntimeLifecycleJobRecord,
+        status: CompletionStatus,
+        failure_code: str | None,
+        now: datetime,
+    ) -> None:
+        job.status = status
+        job.completed_at = now
+        job.failure_code = failure_code
+        job.lease_owner = None
+        job.lease_expires_at = None
+
+    def _append_supervisor_audit(
+        self,
+        session: Session,
+        job: RuntimeLifecycleJobRecord,
+        instance: RuntimeInstanceRecord,
+        actor: str,
+        adapter_template_revision_id: str | None,
+        previous_state: RuntimeInstanceAuditState,
+        next_state: RuntimeInstanceAuditState,
+        result_code: str,
+        now: datetime,
+    ) -> None:
+        self._append_audit_record(
+            session,
+            RuntimeAuditEvent(
+                actor_type=actor,
+                request_id=job.job_id,
+                idempotency_key=job.idempotency_key,
+                owner_kind=instance.owner_kind,
+                owner_id=instance.owner_id,
+                owner_revision=instance.owner_revision,
+                instance_id=instance.instance_id,
+                runtime_spec_revision_id=instance.runtime_spec_revision_id,
+                adapter_template_revision_id=adapter_template_revision_id,
+                action=RuntimeAuditAction(job.requested_action),
+                previous_state=previous_state,
+                next_state=next_state,
+                result_code=result_code,
+            ),
+            now,
+        )
 
     def _apply_command(
         self,
