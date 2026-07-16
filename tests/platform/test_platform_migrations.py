@@ -53,6 +53,9 @@ REGISTRATION_MIGRATION_PATH = (
 LEASE_GENERATION_MIGRATION_PATH = (
     MIGRATIONS_ROOT / "versions" / "20260717_0005_runtime_lease_generation.py"
 )
+STALE_JOB_INDEX_MIGRATION_PATH = (
+    MIGRATIONS_ROOT / "versions" / "20260717_0006_runtime_stale_job_index.py"
+)
 
 EXPECTED_COLUMNS = {
     "platform_catalog_revisions": {
@@ -839,7 +842,7 @@ def test_test_url_fallback_upgrade_commits_registry_head(postgres_url: str) -> N
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0005"
+                == "20260717_0006"
             )
     finally:
         engine.dispose()
@@ -953,7 +956,7 @@ def test_caller_search_path_cannot_redirect_migration_state(postgres_url: str) -
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM public.alembic_version"
             ).scalar_one()
-        assert version == "20260717_0005"
+        assert version == "20260717_0006"
     finally:
         with engine.begin() as connection:
             connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {shadow_schema} CASCADE")
@@ -1117,6 +1120,15 @@ def test_registry_schema_matches_exact_columns_constraints_and_indexes(
         }
         assert attempt_indexes["uq_runtime_attempt_active"]["unique"] is True
         assert job_indexes["uq_runtime_job_active"]["unique"] is True
+        stale_index = job_indexes["ix_runtime_job_stale_reconciliation"]
+        assert stale_index["unique"] is False
+        assert tuple(stale_index["column_names"]) == (
+            "status",
+            "failure_code",
+            "completed_at",
+            "job_id",
+        )
+        assert "postgresql_where" not in stale_index["dialect_options"]
         for index_name, index in (
             ("uq_runtime_attempt_active", attempt_indexes["uq_runtime_attempt_active"]),
             ("uq_runtime_job_active", job_indexes["uq_runtime_job_active"]),
@@ -1428,7 +1440,7 @@ def test_lease_generation_migration_blocks_concurrent_legacy_claim(
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0005"
+                == "20260717_0006"
             )
             row = connection.exec_driver_sql(
                 "SELECT status, lease_generation FROM public.runtime_lifecycle_jobs "
@@ -1487,7 +1499,7 @@ def test_lease_generation_migration_normalizes_legacy_health_and_guards_downgrad
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0005"
+                == "20260717_0006"
             )
         preserved = SqlRuntimeRepository(engine).get_latest_attempt_material("instance-1")
         assert preserved is not None
@@ -1522,7 +1534,7 @@ def test_lease_generation_downgrade_rejects_nonzero_generation_without_legacy_he
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0005"
+                == "20260717_0006"
             )
             generation = connection.exec_driver_sql(
                 "SELECT lease_generation FROM public.runtime_lifecycle_jobs "
@@ -1544,13 +1556,65 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     assert migration["revision"] == "20260714_0004"
     assert migration["down_revision"] == "20260714_0003"
     assert ScriptDirectory.from_config(Config(str(ALEMBIC_CONFIG_PATH))).get_heads() == [
-        "20260717_0005"
+        "20260717_0006"
     ]
 
     lease_migration = runpy.run_path(str(LEASE_GENERATION_MIGRATION_PATH))
     assert lease_migration["revision"] == "20260717_0005"
     assert lease_migration["down_revision"] == "20260714_0004"
     assert "'observed_at'" in lease_migration["_NORMALIZE_LEGACY_HEALTH_SQL"]
+    stale_index_migration = runpy.run_path(str(STALE_JOB_INDEX_MIGRATION_PATH))
+    assert stale_index_migration["revision"] == "20260717_0006"
+    assert stale_index_migration["down_revision"] == "20260717_0005"
+
+
+def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0005")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(
+                insert(tables["runtime_instances"]).values(**_instance_values())
+            )
+            connection.execute(
+                insert(tables["runtime_lifecycle_jobs"]).values(**_job_values())
+            )
+
+        def index_names() -> set[str]:
+            return {
+                index["name"]
+                for index in inspect(engine).get_indexes("runtime_lifecycle_jobs")
+            }
+
+        def persisted_job() -> tuple[str, str, int]:
+            with engine.connect() as connection:
+                row = connection.exec_driver_sql(
+                    "SELECT job_id, status, lease_generation "
+                    "FROM public.runtime_lifecycle_jobs WHERE job_id = 'job-1'"
+                ).one()
+                return row[0], row[1], row[2]
+
+        expected = ("job-1", "pending", 0)
+        assert persisted_job() == expected
+        assert "ix_runtime_job_stale_reconciliation" not in index_names()
+
+        command.upgrade(config, "20260717_0006")
+        assert persisted_job() == expected
+        assert "ix_runtime_job_stale_reconciliation" in index_names()
+
+        command.downgrade(config, "20260717_0005")
+        assert persisted_job() == expected
+        assert "ix_runtime_job_stale_reconciliation" not in index_names()
+
+        command.upgrade(config, "head")
+        assert persisted_job() == expected
+        assert "ix_runtime_job_stale_reconciliation" in index_names()
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize(
@@ -1560,6 +1624,7 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
         "20260712_0002",
         "20260714_0003",
         "20260714_0004",
+        "20260717_0005",
         "head",
     ],
 )
@@ -1576,7 +1641,7 @@ def test_registration_migration_upgrades_supported_postgres_fixtures(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260717_0005"
+            assert version == "20260717_0006"
     finally:
         engine.dispose()
 
@@ -1641,7 +1706,7 @@ def test_registration_migration_refuses_populated_downgrade_and_preserves_audit(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260717_0005"
+            assert version == "20260717_0006"
             assert connection.execute(
                 select(audit.c.action).where(
                     audit.c.audit_event_id == "audit-register-phase2-spot-paper-probe"

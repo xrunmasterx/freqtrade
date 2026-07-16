@@ -2017,6 +2017,28 @@ def test_renew_lease_is_bounded_and_owner_safe(
         )
 
 
+def test_renew_lease_preserves_running_attempt_and_generation(
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job: RuntimeJobView,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    clock.now += timedelta(seconds=5)
+
+    renewed = repository.renew_lease(
+        running_job.job_id,
+        "supervisor-1",
+        running_job.lease_generation,
+        lease_seconds=60,
+    )
+
+    assert renewed.status == "running"
+    assert renewed.lease_owner == running_job.lease_owner
+    assert renewed.lease_generation == running_job.lease_generation
+    assert renewed.lease_expires_at == clock.now + timedelta(seconds=60)
+    assert repository.list_attempts("instance-1") == (attempt,)
+
+
 def test_audit_failure_rolls_back_healthy_attempt_job_and_instance(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
@@ -2686,3 +2708,120 @@ def test_postgres_two_prepared_candidates_create_at_most_one_active_attempt(
     assert {attempt.attempt_id for attempt in repository.list_attempts("instance-1")} == {
         attempts[0].attempt_id
     }
+
+
+def test_postgres_concurrent_reclaims_allow_one_owner_and_fence_previous_generation(
+    postgres_engine: Engine,
+    clock: MutableClock,
+) -> None:
+    _seed_instance(postgres_engine)
+    repository = SqlRuntimeRepository(postgres_engine, clock=clock)
+    repository.create_job(_command("start", "start-1"), "operator_cli")
+    claimed = repository.claim_next_job("supervisor-original", lease_seconds=30)
+    assert claimed is not None
+    attempt = _begin_attempt(
+        repository,
+        claimed.job_id,
+        lease_owner="supervisor-original",
+        lease_generation=claimed.lease_generation,
+    )
+    clock.now += timedelta(seconds=31)
+    stale = repository.claim_next_job("supervisor-reaper", lease_seconds=30)
+    assert stale is not None
+    assert stale.status == "needs_reconciliation"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            owner: executor.submit(
+                repository.reclaim_reconciliation_job,
+                claimed.job_id,
+                owner,
+                30,
+            )
+            for owner in ("supervisor-a", "supervisor-b")
+        }
+
+    successes = []
+    failures = []
+    for owner, future in futures.items():
+        try:
+            successes.append((owner, future.result()))
+        except RuntimeInvalidTransition as error:
+            failures.append(str(error))
+
+    assert len(successes) == 1
+    assert failures == ["stale_lease_reconciliation_required"]
+    winning_owner, reclaimed = successes[0]
+    assert reclaimed.lease_owner == winning_owner
+    assert reclaimed.lease_generation == claimed.lease_generation + 1
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^lease_generation_mismatch$"):
+        repository.record_failed(
+            claimed.job_id,
+            attempt.attempt_id,
+            "stale_worker_write",
+            lease_owner="supervisor-original",
+            lease_generation=claimed.lease_generation,
+        )
+
+
+def test_postgres_claim_prioritizes_preexisting_stale_before_new_expiry_and_pending(
+    postgres_engine: Engine,
+    clock: MutableClock,
+) -> None:
+    for instance_id in ("instance-1", "instance-2", "instance-3"):
+        _seed_instance(postgres_engine, instance_id)
+    repository = SqlRuntimeRepository(
+        postgres_engine,
+        clock=clock,
+        id_factory=SequentialIds(),
+    )
+    repository.create_job(
+        _command("start", "start-1", instance_id="instance-1"),
+        "operator_cli",
+    )
+    first = repository.claim_next_job("supervisor-original", lease_seconds=30)
+    assert first is not None
+    repository.create_job(
+        _command("start", "start-2", instance_id="instance-2"),
+        "operator_cli",
+    )
+    second = repository.claim_next_job("supervisor-original", lease_seconds=30)
+    assert second is not None
+    repository.create_job(
+        _command("start", "start-3", instance_id="instance-3"),
+        "operator_cli",
+    )
+
+    clock.now += timedelta(seconds=31)
+    discovered = repository.claim_next_job("supervisor-reaper", lease_seconds=30)
+    assert discovered is not None
+    assert discovered.job_id == first.job_id
+    assert discovered.status == "needs_reconciliation"
+    before_rediscovery = discovered
+
+    rediscovered = repository.claim_next_job("supervisor-restarted", lease_seconds=30)
+    assert rediscovered is not None
+    assert rediscovered == before_rediscovery
+    assert rediscovered.lease_owner is None
+    assert rediscovered.lease_generation == first.lease_generation
+    assert rediscovered.failure_code == "stale_lease"
+
+    repository.reclaim_reconciliation_job(
+        first.job_id,
+        "supervisor-restarted",
+        30,
+    )
+    next_stale = repository.claim_next_job("supervisor-reaper", lease_seconds=30)
+    assert next_stale is not None
+    assert next_stale.job_id == second.job_id
+    assert next_stale.status == "needs_reconciliation"
+    repository.reclaim_reconciliation_job(
+        second.job_id,
+        "supervisor-reaper",
+        30,
+    )
+    pending = repository.claim_next_job("supervisor-final", lease_seconds=30)
+    assert pending is not None
+    assert pending.instance_id == "instance-3"
+    assert pending.status == "claimed"

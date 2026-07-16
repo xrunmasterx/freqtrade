@@ -181,6 +181,13 @@ Index(
     unique=True,
     postgresql_where=RuntimeLifecycleJobRecord.status.in_(("pending", "claimed", "running")),
 )
+Index(
+    "ix_runtime_job_stale_reconciliation",
+    RuntimeLifecycleJobRecord.status,
+    RuntimeLifecycleJobRecord.failure_code,
+    RuntimeLifecycleJobRecord.completed_at,
+    RuntimeLifecycleJobRecord.job_id,
+)
 
 
 class RuntimeEndpointRecord(PlatformBase):

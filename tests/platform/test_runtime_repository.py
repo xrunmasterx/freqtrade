@@ -748,6 +748,57 @@ def test_expired_lease_is_reconciled_before_pending_claim(
     assert _counts(engine) == (2, 2, 4)
 
 
+def test_claim_exposes_preexisting_stale_before_newly_expired_and_pending_jobs(
+    repository: SqlRuntimeRepository,
+    engine: Engine,
+    clock: MutableClock,
+) -> None:
+    for instance_id in ("instance-a", "instance-b", "instance-c"):
+        _seed_instance(engine, instance_id)
+        repository.create_job(
+            _command("start", f"key-{instance_id}", instance_id=instance_id),
+            "operator_cli",
+        )
+    first = repository.claim_next_job("supervisor-a", lease_seconds=10)
+    second = repository.claim_next_job("supervisor-b", lease_seconds=10)
+    assert first is not None and second is not None
+    clock.now += timedelta(seconds=11)
+
+    newly_stale = repository.claim_next_job("supervisor-reaper", lease_seconds=10)
+    assert newly_stale is not None
+    assert newly_stale.job_id == first.job_id
+    assert newly_stale.status == "needs_reconciliation"
+    assert newly_stale.failure_code == "stale_lease"
+
+    rediscovered = repository.claim_next_job("supervisor-restart", lease_seconds=10)
+
+    assert rediscovered is not None
+    assert rediscovered.job_id == first.job_id
+    assert rediscovered.status == "needs_reconciliation"
+    assert rediscovered.lease_owner is None
+    assert rediscovered.lease_generation == first.lease_generation
+
+    repository.reclaim_reconciliation_job(
+        rediscovered.job_id,
+        "supervisor-restart",
+        lease_seconds=10,
+    )
+    next_expired = repository.claim_next_job("supervisor-reaper", lease_seconds=10)
+    assert next_expired is not None
+    assert next_expired.job_id == second.job_id
+    assert next_expired.status == "needs_reconciliation"
+
+    repository.reclaim_reconciliation_job(
+        next_expired.job_id,
+        "supervisor-restart",
+        lease_seconds=10,
+    )
+    pending = repository.claim_next_job("supervisor-restart", lease_seconds=10)
+    assert pending is not None
+    assert pending.instance_id == "instance-c"
+    assert pending.status == "claimed"
+
+
 @pytest.mark.parametrize("expired_status", ["claimed", "running"])
 def test_postgres_expired_lease_is_reconciled_before_pending_claim(
     postgres_repository: SqlRuntimeRepository,

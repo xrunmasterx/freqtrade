@@ -587,6 +587,22 @@ class SqlRuntimeRepository:
         ):
             raise RuntimeInvalidTransition("invalid_lease_seconds")
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            reconciliation = session.scalar(
+                select(RuntimeLifecycleJobRecord)
+                .where(
+                    RuntimeLifecycleJobRecord.status == "needs_reconciliation",
+                    RuntimeLifecycleJobRecord.failure_code == "stale_lease",
+                )
+                .order_by(
+                    RuntimeLifecycleJobRecord.completed_at,
+                    RuntimeLifecycleJobRecord.job_id,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if reconciliation is not None:
+                return self._job_view(reconciliation)
+
             selection_time = self._now()
             expired = session.scalar(
                 select(RuntimeLifecycleJobRecord)
