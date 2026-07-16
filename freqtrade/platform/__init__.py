@@ -36,6 +36,7 @@ from freqtrade.platform.runtime_registration_repository import (
     SqlPaperProbeRegistrationRepository,
 )
 from freqtrade.platform.runtime_repository import (
+    PersistedLaunchAuthority,
     RuntimeAuditEvent,
     RuntimeConflict,
     RuntimeDataError,
@@ -45,6 +46,7 @@ from freqtrade.platform.runtime_repository import (
     RuntimeQueryRepository,
     RuntimeRepository,
     SqlRuntimeRepository,
+    StateAllocationPreparationMaterial,
 )
 from freqtrade.platform.runtime_service import (
     RuntimeApplicationService,
@@ -89,6 +91,7 @@ __all__ = [
     "PaperProbeRegistrationNotFound",
     "PaperProbeRegistrationResult",
     "PaperProbeRegistrationStatus",
+    "PersistedLaunchAuthority",
     "RuntimeAction",
     "RuntimeAuditAction",
     "RuntimeApplicationService",
@@ -123,6 +126,7 @@ __all__ = [
     "SqlTemplateRepository",
     "StateAllocation",
     "StateAllocationKind",
+    "StateAllocationPreparationMaterial",
     "StateAllocationStatus",
     "StaticCatalogRepository",
     "TemplateStatus",

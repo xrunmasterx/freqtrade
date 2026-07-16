@@ -77,6 +77,10 @@ class RuntimeAttemptRecord(PlatformBase):
             name="ck_runtime_attempts_attempt_number",
         ),
         CheckConstraint(
+            "state_allocation_generation >= 1",
+            name="ck_runtime_attempts_state_allocation_generation",
+        ),
+        CheckConstraint(
             "status IN "
             "('pending', 'validating', 'launching', 'healthy', 'stopping', 'stopped', 'failed')",
             name="ck_runtime_attempts_status",
@@ -96,6 +100,16 @@ class RuntimeAttemptRecord(PlatformBase):
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     runtime_spec_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
     adapter_template_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    state_allocation_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey(
+            "state_allocations.state_allocation_id",
+            name="fk_runtime_attempts_state_allocation_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    state_allocation_generation: Mapped[int] = mapped_column(Integer, nullable=False)
     resolved_secret_versions: Mapped[dict] = mapped_column(JSON, nullable=False)
     image_id: Mapped[str] = mapped_column(String(256), nullable=False)
     root_commit: Mapped[str] = mapped_column(String(64), nullable=False)

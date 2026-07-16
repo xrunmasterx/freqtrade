@@ -123,6 +123,7 @@ EXPECTED_CHECKS = {
         "ck_state_allocations_provider_id",
         "ck_state_allocations_relative_path",
         "ck_state_allocations_status",
+        "ck_state_allocations_status_timestamps",
     },
     "secret_references": {
         "ck_secret_references_owner_kind",
@@ -421,6 +422,9 @@ def test_revision_chain_and_shared_metadata_define_the_exact_task1_schema() -> N
     assert (
         "relative_path = 'ft_userdata/runtime/instances/' || instance_id" in path_check
     )
+    timestamp_check = state_checks["ck_state_allocations_status_timestamps"]
+    assert "status = 'ready' AND ready_at IS NOT NULL AND retired_at IS NULL" in timestamp_check
+    assert "status = 'retired' AND ready_at IS NULL AND retired_at IS NOT NULL" in timestamp_check
 
     runtime_spec_checks = {
         constraint.name: str(constraint.sqltext)
@@ -519,7 +523,7 @@ def test_nonempty_0001_upgrade_preserves_identity_and_uses_not_valid_fks(
                 for name, table in tables.items()
             }
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "20260712_0002")
 
         with engine.connect() as connection:
             after = {
@@ -826,12 +830,16 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
         _expect_integrity_error(
             engine,
             tables["state_allocations"],
-            _allocation_values("allocation-2", status="ready"),
+            _allocation_values("allocation-2", status="ready", ready_at=NOW),
         )
         _expect_integrity_error(
             engine,
             tables["state_allocations"],
-            _allocation_values("allocation-retired", status="retired"),
+            _allocation_values(
+                "allocation-retired",
+                status="retired",
+                retired_at=NOW,
+            ),
         )
         with engine.begin() as connection:
             connection.execute(
@@ -840,6 +848,7 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
                         "allocation-other-instance",
                         instance_id="other-instance",
                         status="retired",
+                        retired_at=NOW,
                     )
                 )
             )
@@ -919,6 +928,49 @@ def test_postgres_rejects_conflicting_digests_closed_values_and_multiple_active_
                     "bad-state-status",
                     instance_id="bad-state-status",
                     status="deleted",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-ready-without-ready-at",
+                    instance_id="bad-ready-without-ready-at",
+                    status="ready",
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-reserved-with-ready-at",
+                    instance_id="bad-reserved-with-ready-at",
+                    status="reserved",
+                    ready_at=NOW,
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-provisioning-with-retired-at",
+                    instance_id="bad-provisioning-with-retired-at",
+                    status="provisioning",
+                    retired_at=NOW,
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-quarantined-with-ready-at",
+                    instance_id="bad-quarantined-with-ready-at",
+                    status="quarantined",
+                    ready_at=NOW,
+                ),
+            ),
+            (
+                "state_allocations",
+                _allocation_values(
+                    "bad-retired-without-retired-at",
+                    instance_id="bad-retired-without-retired-at",
+                    status="retired",
                 ),
             ),
             (

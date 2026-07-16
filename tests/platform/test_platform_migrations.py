@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import alembic
 import pytest
@@ -31,7 +32,11 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 
+from freqtrade.platform.runtime_registration_repository import (
+    SqlPaperProbeRegistrationRepository,
+)
 from freqtrade.platform.runtime_repository import SqlRuntimeRepository
+from freqtrade.platform.template_repository import SqlTemplateRepository
 from tests.platform import postgres_test_support
 from tests.platform.postgres_test_support import (
     RedactedPostgresUrl as _RedactedPostgresUrl,
@@ -42,6 +47,7 @@ from tests.platform.postgres_test_support import (
 from tests.platform.postgres_test_support import (
     validate_test_database_url as _validate_test_database_url,
 )
+from tests.platform.test_runtime_registration_repository import _publication, _request
 
 
 BACKEND_ROOT = Path(__file__).parents[2]
@@ -55,6 +61,12 @@ LEASE_GENERATION_MIGRATION_PATH = (
 )
 STALE_JOB_INDEX_MIGRATION_PATH = (
     MIGRATIONS_ROOT / "versions" / "20260717_0006_runtime_stale_job_index.py"
+)
+STATE_TIMESTAMPS_MIGRATION_PATH = (
+    MIGRATIONS_ROOT / "versions" / "20260717_0007_state_allocation_timestamps.py"
+)
+ATTEMPT_STATE_BINDING_MIGRATION_PATH = (
+    MIGRATIONS_ROOT / "versions" / "20260717_0008_attempt_state_binding.py"
 )
 
 EXPECTED_COLUMNS = {
@@ -86,6 +98,8 @@ EXPECTED_COLUMNS = {
         "attempt_number",
         "runtime_spec_revision_id",
         "adapter_template_revision_id",
+        "state_allocation_id",
+        "state_allocation_generation",
         "resolved_secret_versions",
         "image_id",
         "root_commit",
@@ -218,6 +232,7 @@ EXPECTED_STRING_LENGTHS = {
         "instance_id": 128,
         "runtime_spec_revision_id": 128,
         "adapter_template_revision_id": 128,
+        "state_allocation_id": 128,
         "image_id": 256,
         "root_commit": 64,
         "backend_commit": 64,
@@ -272,7 +287,11 @@ EXPECTED_STRING_LENGTHS = {
 }
 EXPECTED_INTEGER_COLUMNS = {
     "runtime_instances": {"optimistic_version"},
-    "runtime_attempts": {"attempt_number", "exit_code"},
+    "runtime_attempts": {
+        "attempt_number",
+        "state_allocation_generation",
+        "exit_code",
+    },
     "runtime_lifecycle_jobs": {"expected_instance_version", "lease_generation"},
     "runtime_endpoints": {"internal_port"},
 }
@@ -321,6 +340,11 @@ EXPECTED_FOREIGN_KEYS = {
             ("adapter_template_revision_id",),
             "adapter_template_revisions",
         ),
+        (
+            "fk_runtime_attempts_state_allocation_id",
+            ("state_allocation_id",),
+            "state_allocations",
+        ),
     },
     "runtime_lifecycle_jobs": {
         ("fk_runtime_lifecycle_jobs_instance_id", ("instance_id",), "runtime_instances")
@@ -359,6 +383,7 @@ EXPECTED_CHECKS = {
     },
     "runtime_attempts": {
         "ck_runtime_attempts_attempt_number",
+        "ck_runtime_attempts_state_allocation_generation",
         "ck_runtime_attempts_status",
     },
     "runtime_lifecycle_jobs": {
@@ -393,6 +418,47 @@ def _alembic_config(postgres_url: str) -> Config:
     config = Config(str(ALEMBIC_CONFIG_PATH))
     config.set_main_option("sqlalchemy.url", postgres_url.replace("%", "%%"))
     return config
+
+
+def _bounded_alembic_config(postgres_url: str) -> Config:
+    bounded_url = sqlalchemy.engine.make_url(postgres_url).update_query_dict(
+        {"options": "-clock_timeout=8s -cstatement_timeout=10s"}
+    )
+    return _alembic_config(bounded_url.render_as_string(hide_password=False))
+
+
+def _wait_for_relation_lock(
+    engine: Engine,
+    relation_name: str,
+    mode: str,
+    *,
+    granted: bool,
+) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with engine.connect() as connection:
+            found = connection.execute(
+                sqlalchemy.text(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_locks AS locks "
+                    "JOIN pg_class AS relation ON relation.oid = locks.relation "
+                    "JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+                    "WHERE namespace.nspname = 'public' "
+                    "AND locks.database = ("
+                    "SELECT oid FROM pg_database WHERE datname = current_database()) "
+                    "AND relation.relname = :relation_name "
+                    "AND locks.mode = :mode AND locks.granted = :granted)"
+                ),
+                {
+                    "relation_name": relation_name,
+                    "mode": mode,
+                    "granted": granted,
+                },
+            ).scalar_one()
+        if found:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {mode} on public.{relation_name}")
 
 
 def _load_tables(postgres_url: str) -> tuple[Engine, dict[str, Table]]:
@@ -493,6 +559,8 @@ def _attempt_values(attempt_id: str = "attempt-1", **updates: object) -> dict[st
         "attempt_number": 1,
         "runtime_spec_revision_id": RUNTIME_SPEC_REVISION_ID,
         "adapter_template_revision_id": "adapter-template-1",
+        "state_allocation_id": "state-allocation-1",
+        "state_allocation_generation": 1,
         "resolved_secret_versions": {"exchange": "secret-version-1"},
         "image_id": "sha256:image-1",
         "root_commit": "1" * 40,
@@ -842,7 +910,7 @@ def test_test_url_fallback_upgrade_commits_registry_head(postgres_url: str) -> N
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0008"
             )
     finally:
         engine.dispose()
@@ -956,7 +1024,7 @@ def test_caller_search_path_cannot_redirect_migration_state(postgres_url: str) -
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM public.alembic_version"
             ).scalar_one()
-        assert version == "20260717_0006"
+        assert version == "20260717_0008"
     finally:
         with engine.begin() as connection:
             connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {shadow_schema} CASCADE")
@@ -1440,7 +1508,7 @@ def test_lease_generation_migration_blocks_concurrent_legacy_claim(
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0008"
             )
             row = connection.exec_driver_sql(
                 "SELECT status, lease_generation FROM public.runtime_lifecycle_jobs "
@@ -1461,19 +1529,18 @@ def test_lease_generation_migration_normalizes_legacy_health_and_guards_downgrad
     command.upgrade(config, "20260714_0004")
     engine, tables = _load_tables(postgres_url)
     try:
+        legacy_attempt = _attempt_values(
+            status="healthy",
+            health_result={"result_code": "healthy"},
+            image_id=f"sha256:{'a' * 64}",
+            started_at=None,
+        )
+        legacy_attempt.pop("state_allocation_id")
+        legacy_attempt.pop("state_allocation_generation")
         with engine.begin() as connection:
             _seed_runtime_parent_chain(connection, tables)
             connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
-            connection.execute(
-                insert(tables["runtime_attempts"]).values(
-                    **_attempt_values(
-                        status="healthy",
-                        health_result={"result_code": "healthy"},
-                        image_id=f"sha256:{'a' * 64}",
-                        started_at=None,
-                    )
-                )
-            )
+            connection.execute(insert(tables["runtime_attempts"]).values(**legacy_attempt))
 
         command.upgrade(config, "head")
         recovery = SqlRuntimeRepository(engine).get_latest_attempt_material("instance-1")
@@ -1493,13 +1560,16 @@ def test_lease_generation_migration_normalizes_legacy_health_and_guards_downgrad
         assert generation_column["nullable"] is False
         assert generation_column["default"] is None
 
-        with pytest.raises(sqlalchemy.exc.DBAPIError, match="runtime_task6_downgrade_refused"):
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_attempt_state_binding_downgrade_refused",
+        ):
             command.downgrade(config, "20260714_0004")
 
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0008"
             )
         preserved = SqlRuntimeRepository(engine).get_latest_attempt_material("instance-1")
         assert preserved is not None
@@ -1534,7 +1604,7 @@ def test_lease_generation_downgrade_rejects_nonzero_generation_without_legacy_he
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0008"
             )
             generation = connection.exec_driver_sql(
                 "SELECT lease_generation FROM public.runtime_lifecycle_jobs "
@@ -1556,7 +1626,7 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     assert migration["revision"] == "20260714_0004"
     assert migration["down_revision"] == "20260714_0003"
     assert ScriptDirectory.from_config(Config(str(ALEMBIC_CONFIG_PATH))).get_heads() == [
-        "20260717_0006"
+        "20260717_0008"
     ]
 
     lease_migration = runpy.run_path(str(LEASE_GENERATION_MIGRATION_PATH))
@@ -1566,6 +1636,36 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     stale_index_migration = runpy.run_path(str(STALE_JOB_INDEX_MIGRATION_PATH))
     assert stale_index_migration["revision"] == "20260717_0006"
     assert stale_index_migration["down_revision"] == "20260717_0005"
+    state_timestamps_migration = runpy.run_path(str(STATE_TIMESTAMPS_MIGRATION_PATH))
+    assert state_timestamps_migration["revision"] == "20260717_0007"
+    assert state_timestamps_migration["down_revision"] == "20260717_0006"
+    assert "ready_at IS NOT NULL" in state_timestamps_migration[
+        "_STATUS_TIMESTAMPS_CHECK"
+    ]
+    attempt_state_binding_migration = runpy.run_path(
+        str(ATTEMPT_STATE_BINDING_MIGRATION_PATH)
+    )
+    assert attempt_state_binding_migration["revision"] == "20260717_0008"
+    assert attempt_state_binding_migration["down_revision"] == "20260717_0007"
+    assert "runtime_attempt_state_binding_backfill_failed" in (
+        attempt_state_binding_migration["_LEGACY_BINDING_GUARD_SQL"]
+    )
+    assert "runtime_attempt_state_binding_generation_unprovable" in (
+        attempt_state_binding_migration["_LEGACY_GENERATION_GUARD_SQL"]
+    )
+    assert "runtime_attempt_state_binding_downgrade_refused" in (
+        attempt_state_binding_migration["_DOWNGRADE_GUARD_SQL"]
+    )
+    quiescence_gate = attempt_state_binding_migration["_QUIESCENCE_GATE_SQL"]
+    assert "runtime_attempt_state_binding_quiescence_failed" in quiescence_gate
+    assert quiescence_gate.index("runtime_instances") < quiescence_gate.index(
+        "runtime_spec_revisions"
+    )
+    assert quiescence_gate.index("runtime_spec_revisions") < quiescence_gate.index(
+        "state_allocations"
+    )
+    assert "IN EXCLUSIVE MODE NOWAIT" in quiescence_gate
+    assert "runtime_attempts IN ACCESS EXCLUSIVE MODE NOWAIT" in quiescence_gate
 
 
 def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
@@ -1617,6 +1717,478 @@ def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
         engine.dispose()
 
 
+def test_state_timestamp_migration_fails_closed_then_preserves_repaired_allocation(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0006")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(
+                tables["state_allocations"]
+                .update()
+                .where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+                .values(status="ready", ready_at=None)
+            )
+
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="ck_state_allocations_status_timestamps",
+        ):
+            command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one() == "20260717_0006"
+
+        with engine.begin() as connection:
+            connection.execute(
+                tables["state_allocations"]
+                .update()
+                .where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+                .values(ready_at=datetime(2026, 7, 17, tzinfo=UTC))
+            )
+        command.upgrade(config, "head")
+        assert "ck_state_allocations_status_timestamps" in {
+            check["name"]
+            for check in inspect(engine).get_check_constraints("state_allocations")
+        }
+
+        command.downgrade(config, "20260717_0006")
+        with engine.connect() as connection:
+            row = connection.execute(
+                select(
+                    tables["state_allocations"].c.status,
+                    tables["state_allocations"].c.ready_at,
+                ).where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+            ).one()
+        assert row.status == "ready"
+        assert row.ready_at is not None
+        assert "ck_state_allocations_status_timestamps" not in {
+            check["name"]
+            for check in inspect(engine).get_check_constraints("state_allocations")
+        }
+    finally:
+        engine.dispose()
+
+
+def test_attempt_state_binding_migration_backfills_exact_generation(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0007")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        legacy_attempt = _attempt_values()
+        legacy_attempt.pop("state_allocation_id")
+        legacy_attempt.pop("state_allocation_generation")
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(insert(tables["runtime_attempts"]).values(**legacy_attempt))
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            binding = connection.exec_driver_sql(
+                "SELECT state_allocation_id, state_allocation_generation "
+                "FROM public.runtime_attempts WHERE attempt_id = 'attempt-1'"
+            ).one()
+        assert binding == ("state-allocation-1", 1)
+
+    finally:
+        engine.dispose()
+
+
+def test_attempt_state_binding_migration_downgrade_requires_empty_attempt_table(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(insert(tables["runtime_attempts"]).values(**_attempt_values()))
+        before_columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        with engine.connect() as connection:
+            before = connection.execute(tables["runtime_attempts"].select()).one()
+
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_attempt_state_binding_downgrade_refused",
+        ):
+            command.downgrade(config, "20260717_0007")
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0008"
+            after = connection.execute(tables["runtime_attempts"].select()).one()
+        assert after == before
+        assert {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        } == before_columns
+    finally:
+        engine.dispose()
+
+
+def test_attempt_state_binding_downgrade_rejects_concurrent_attempt_insert(
+    postgres_url: str,
+) -> None:
+    config = _bounded_alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    engine, tables = _load_tables(postgres_url)
+    writer = engine.connect()
+    writer_transaction = writer.begin()
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+        writer.exec_driver_sql(
+            "SELECT instance_id FROM public.runtime_instances "
+            "WHERE instance_id = 'instance-1' FOR UPDATE"
+        ).one()
+        writer.execute(insert(tables["runtime_attempts"]).values(**_attempt_values()))
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            downgrade = executor.submit(command.downgrade, config, "20260717_0007")
+            with pytest.raises(
+                sqlalchemy.exc.DBAPIError,
+                match="runtime_attempt_state_binding_quiescence_failed",
+            ):
+                downgrade.result(timeout=2)
+
+        assert writer_transaction.is_active
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0008"
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" in columns
+        assert "state_allocation_generation" in columns
+
+        writer_transaction.commit()
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_attempt_state_binding_downgrade_refused",
+        ):
+            command.downgrade(config, "20260717_0007")
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0008"
+            assert connection.exec_driver_sql(
+                "SELECT state_allocation_id, state_allocation_generation "
+                "FROM public.runtime_attempts WHERE attempt_id = 'attempt-1'"
+            ).one() == ("state-allocation-1", 1)
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer.close()
+        engine.dispose()
+
+
+def test_attempt_state_binding_upgrade_rejects_concurrent_registration(
+    postgres_url: str,
+) -> None:
+    config = _bounded_alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0007")
+    engine = create_engine(postgres_url)
+    request = _request(
+        SqlTemplateRepository(engine)
+        .publish_template(_publication(), "platform-admin", datetime(2026, 7, 17, tzinfo=UTC))
+        .revision_id
+    )
+    repository = SqlPaperProbeRegistrationRepository(engine)
+    allocation_inserted = Event()
+    allow_registration_to_finish = Event()
+
+    def pause_after_allocation_insert(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("INSERT INTO STATE_ALLOCATIONS"):
+            allocation_inserted.set()
+            if not allow_registration_to_finish.wait(timeout=5):
+                raise AssertionError("timed out waiting to finish concurrent registration")
+
+    sqlalchemy.event.listen(engine, "after_cursor_execute", pause_after_allocation_insert)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            registration = executor.submit(
+                repository.ensure_paper_probe_registration,
+                request,
+                "operator_cli",
+                datetime(2026, 7, 17, tzinfo=UTC),
+            )
+            assert allocation_inserted.wait(timeout=5)
+
+            upgrade = executor.submit(command.upgrade, config, "head")
+            with pytest.raises(
+                sqlalchemy.exc.DBAPIError,
+                match="runtime_attempt_state_binding_quiescence_failed",
+            ):
+                upgrade.result(timeout=2)
+
+            assert not registration.done()
+            with engine.connect() as connection:
+                assert connection.exec_driver_sql(
+                    "SELECT version_num FROM public.alembic_version"
+                ).scalar_one() == "20260717_0007"
+                assert connection.exec_driver_sql(
+                    "SELECT count(*) FROM public.runtime_instances"
+                ).scalar_one() == 0
+            columns = {
+                column["name"]
+                for column in inspect(engine).get_columns("runtime_attempts")
+            }
+            assert "state_allocation_id" not in columns
+            assert "state_allocation_generation" not in columns
+
+            allow_registration_to_finish.set()
+            registration.result(timeout=5)
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0008"
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM public.runtime_instances"
+            ).scalar_one() == 1
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" in columns
+        assert "state_allocation_generation" in columns
+    finally:
+        allow_registration_to_finish.set()
+        sqlalchemy.event.remove(engine, "after_cursor_execute", pause_after_allocation_insert)
+        engine.dispose()
+
+
+def test_attempt_state_binding_migration_empty_downgrade_removes_binding_columns(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    engine = create_engine(postgres_url)
+    try:
+        command.downgrade(config, "20260717_0007")
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0007"
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" not in columns
+        assert "state_allocation_generation" not in columns
+    finally:
+        engine.dispose()
+
+
+def test_attempt_state_binding_migration_rejects_unprovable_legacy_generation(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0007")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        legacy_attempt = _attempt_values()
+        legacy_attempt.pop("state_allocation_id")
+        legacy_attempt.pop("state_allocation_generation")
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(
+                tables["state_allocations"]
+                .update()
+                .where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+                .values(generation=2)
+            )
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(insert(tables["runtime_attempts"]).values(**legacy_attempt))
+
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_attempt_state_binding_generation_unprovable",
+        ):
+            command.upgrade(config, "head")
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0007"
+            assert connection.exec_driver_sql(
+                "SELECT generation FROM public.state_allocations "
+                "WHERE state_allocation_id = 'state-allocation-1'"
+            ).scalar_one() == 2
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM public.runtime_attempts WHERE attempt_id = 'attempt-1'"
+            ).scalar_one() == 1
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" not in columns
+        assert "state_allocation_generation" not in columns
+    finally:
+        engine.dispose()
+
+
+def test_attempt_state_binding_upgrade_rejects_concurrent_generation_change(
+    postgres_url: str,
+) -> None:
+    config = _bounded_alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0007")
+    engine, tables = _load_tables(postgres_url)
+    writer = engine.connect()
+    writer_transaction = writer.begin()
+    try:
+        legacy_attempt = _attempt_values()
+        legacy_attempt.pop("state_allocation_id")
+        legacy_attempt.pop("state_allocation_generation")
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(insert(tables["runtime_attempts"]).values(**legacy_attempt))
+        writer.execute(
+            tables["state_allocations"]
+            .update()
+            .where(
+                tables["state_allocations"].c.state_allocation_id == "state-allocation-1"
+            )
+            .values(generation=2)
+        )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            upgrade = executor.submit(command.upgrade, config, "head")
+            with pytest.raises(
+                sqlalchemy.exc.DBAPIError,
+                match="runtime_attempt_state_binding_quiescence_failed",
+            ):
+                upgrade.result(timeout=2)
+
+        assert writer_transaction.is_active
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0007"
+            assert connection.exec_driver_sql(
+                "SELECT generation FROM public.state_allocations "
+                "WHERE state_allocation_id = 'state-allocation-1'"
+            ).scalar_one() == 1
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" not in columns
+        assert "state_allocation_generation" not in columns
+
+        writer_transaction.commit()
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_attempt_state_binding_generation_unprovable",
+        ):
+            command.upgrade(config, "head")
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0007"
+            assert connection.exec_driver_sql(
+                "SELECT generation FROM public.state_allocations "
+                "WHERE state_allocation_id = 'state-allocation-1'"
+            ).scalar_one() == 2
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" not in columns
+        assert "state_allocation_generation" not in columns
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer.close()
+        engine.dispose()
+
+
+def test_attempt_state_binding_migration_rejects_unclosed_legacy_binding(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0007")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        legacy_attempt = _attempt_values()
+        legacy_attempt.pop("state_allocation_id")
+        legacy_attempt.pop("state_allocation_generation")
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(
+                insert(tables["state_allocations"]).values(
+                    state_allocation_id="state-allocation-2",
+                    instance_id="instance-1",
+                    layout_id="fixture-layout-1",
+                    provider_id="managed-local-v1",
+                    relative_path="ft_userdata/runtime/instances/instance-1",
+                    kind="fresh",
+                    status="ready",
+                    generation=1,
+                    restore_source_bundle_id=None,
+                    created_at=datetime(2026, 7, 12, tzinfo=UTC),
+                    ready_at=datetime(2026, 7, 12, tzinfo=UTC),
+                    retired_at=None,
+                )
+            )
+            connection.execute(
+                insert(tables["runtime_instances"]).values(
+                    **_instance_values(state_allocation_id="state-allocation-2")
+                )
+            )
+            connection.execute(insert(tables["runtime_attempts"]).values(**legacy_attempt))
+
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_attempt_state_binding_backfill_failed",
+        ):
+            command.upgrade(config, "head")
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM public.alembic_version"
+            ).scalar_one() == "20260717_0007"
+        columns = {
+            column["name"] for column in inspect(engine).get_columns("runtime_attempts")
+        }
+        assert "state_allocation_id" not in columns
+        assert "state_allocation_generation" not in columns
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
     "starting_revision",
     [
@@ -1625,6 +2197,8 @@ def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
         "20260714_0003",
         "20260714_0004",
         "20260717_0005",
+        "20260717_0006",
+        "20260717_0007",
         "head",
     ],
 )
@@ -1641,7 +2215,7 @@ def test_registration_migration_upgrades_supported_postgres_fixtures(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260717_0006"
+            assert version == "20260717_0008"
     finally:
         engine.dispose()
 
@@ -1706,7 +2280,7 @@ def test_registration_migration_refuses_populated_downgrade_and_preserves_audit(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260717_0006"
+            assert version == "20260717_0008"
             assert connection.execute(
                 select(audit.c.action).where(
                     audit.c.audit_event_id == "audit-register-phase2-spot-paper-probe"
