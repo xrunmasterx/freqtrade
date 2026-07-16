@@ -10,6 +10,9 @@ from freqtrade.platform.runtime_registration import (
     PaperProbeRegistrationResult,
     PaperProbeRegistrationStatus,
 )
+from freqtrade.platform.runtime_repository import (
+    ResolvedRuntimeMaterial as ResolvedRuntimeMaterial,
+)
 from freqtrade.platform.runtime_repository import RuntimeRepository
 from freqtrade.platform.template_repository import (
     AdapterTemplateRevisionView,
