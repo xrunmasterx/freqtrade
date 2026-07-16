@@ -2755,12 +2755,20 @@ def test_postgres_concurrent_reclaims_allow_one_owner_and_fence_previous_generat
     assert reclaimed.lease_owner == winning_owner
     assert reclaimed.lease_generation == claimed.lease_generation + 1
 
-    with pytest.raises(RuntimeInvalidTransition, match=r"^lease_generation_mismatch$"):
+    with pytest.raises(RuntimeInvalidTransition, match=r"^lease_owner_mismatch$"):
         repository.record_failed(
             claimed.job_id,
             attempt.attempt_id,
             "stale_worker_write",
             lease_owner="supervisor-original",
+            lease_generation=claimed.lease_generation,
+        )
+    with pytest.raises(RuntimeInvalidTransition, match=r"^lease_generation_mismatch$"):
+        repository.record_failed(
+            claimed.job_id,
+            attempt.attempt_id,
+            "stale_worker_write",
+            lease_owner=winning_owner,
             lease_generation=claimed.lease_generation,
         )
 
