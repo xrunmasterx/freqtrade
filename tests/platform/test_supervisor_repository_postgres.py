@@ -70,9 +70,12 @@ NON_SELECT_TABLE_PRIVILEGES = (
     "MAINTAIN",
 )
 COLUMN_WRITE_PRIVILEGES = ("INSERT", "UPDATE", "REFERENCES")
-# When a reviewed migration grants state_allocations UPDATE(status, ready_at),
-# add those exact entries here. Table-level UPDATE must remain forbidden.
-EXPECTED_AUTHORITY_COLUMN_WRITES: frozenset[tuple[str, str, str]] = frozenset()
+EXPECTED_AUTHORITY_COLUMN_WRITES: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        ("state_allocations", "ready_at", "UPDATE"),
+        ("state_allocations", "status", "UPDATE"),
+    }
+)
 
 
 class _RedactedPostgresUrl(str):
@@ -393,11 +396,11 @@ def _seed_fixture(engine: Engine, material: _FixtureMaterial) -> str:
                         f"ft_userdata/runtime/instances/{material.instance_id}"
                     ),
                     kind="fresh",
-                    status="ready",
+                    status="reserved",
                     generation=1,
                     restore_source_bundle_id=None,
                     created_at=TEST_NOW,
-                    ready_at=TEST_NOW,
+                    ready_at=None,
                     retired_at=None,
                 ),
                 SecretReferenceRecord(
@@ -601,7 +604,7 @@ def _assert_restricted_authority_reads(engine: Engine) -> None:
         assert actual_column_writes == EXPECTED_AUTHORITY_COLUMN_WRITES
 
 
-def test_platform_supervisor_runs_repository_lifecycle_with_read_only_authority(
+def test_platform_supervisor_runs_repository_lifecycle_with_bounded_authority(
     restricted_postgres_urls: _PostgresUrls,
 ) -> None:
     material = _fixture_material()
@@ -635,6 +638,18 @@ def test_platform_supervisor_runs_repository_lifecycle_with_read_only_authority(
         }
         first_attempt_id = repository.prepare_attempt_id(renewed.job_id, **lease)
         assert repository.prepare_attempt_id(renewed.job_id, **lease) == first_attempt_id
+
+        provisioning = repository.begin_state_provisioning(renewed.job_id, **lease)
+        assert provisioning.state_allocation_id == material.state_allocation_id
+        assert provisioning.status == "provisioning"
+        ready = repository.complete_state_provisioning(
+            renewed.job_id,
+            provisioning.state_allocation_id,
+            provisioning.generation,
+            **lease,
+        )
+        assert ready.status == "ready"
+        assert ready.ready_at == TEST_NOW
 
         authority = repository.resolve_launch_authority_material(
             renewed.job_id,

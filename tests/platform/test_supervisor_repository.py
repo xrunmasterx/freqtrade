@@ -529,6 +529,9 @@ def test_supervisor_repository_contract_exposes_all_transition_methods(
 ) -> None:
     for method_name in (
         "prepare_attempt_id",
+        "begin_state_provisioning",
+        "complete_state_provisioning",
+        "quarantine_state_allocation",
         "begin_attempt",
         "get_latest_attempt_material",
         "assert_current_lease",
@@ -2248,6 +2251,7 @@ def test_begin_attempt_revalidates_complete_launch_authority_before_mutation(
             allocation = session.get(StateAllocationRecord, "state-allocation-1")
             assert allocation is not None
             allocation.status = "quarantined"
+            allocation.ready_at = None
         else:
             runtime_spec = session.get(RuntimeSpecRevisionRecord, RUNTIME_SPEC_REVISION_ID)
             assert runtime_spec is not None

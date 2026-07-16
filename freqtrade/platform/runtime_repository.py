@@ -44,6 +44,7 @@ from freqtrade.platform.runtime_spec import RuntimeSpecPayload, RuntimeSpecRevis
 from freqtrade.platform.template_domain import (
     AdapterTemplate,
     SecretReferenceStatus,
+    StateAllocationKind,
     StateAllocationStatus,
     TemplateStatus,
 )
@@ -232,6 +233,42 @@ class PersistedStateAllocationAuthority(_RuntimeRepositoryInput):
     generation: Annotated[int, Field(strict=True, ge=1)]
 
 
+class StateAllocationPreparationMaterial(_RuntimeRepositoryInput):
+    state_allocation_id: Identifier
+    instance_id: Identifier
+    layout_id: Identifier
+    provider_id: Literal["managed-local-v1"]
+    relative_path: str = Field(
+        pattern=r"^ft_userdata/runtime/instances/[A-Za-z0-9_-]+$",
+        max_length=256,
+    )
+    kind: StateAllocationKind
+    status: StateAllocationStatus
+    generation: Annotated[int, Field(strict=True, ge=1)]
+    restore_source_bundle_id: Identifier | None
+    created_at: AwareDatetime
+    ready_at: AwareDatetime | None
+    retired_at: AwareDatetime | None
+
+    @model_validator(mode="after")
+    def require_correlated_state_material(self) -> "StateAllocationPreparationMaterial":
+        expected_relative_path = f"ft_userdata/runtime/instances/{self.instance_id}"
+        if self.relative_path != expected_relative_path:
+            raise ValueError("state allocation relative path is inconsistent")
+        has_restore_source = self.restore_source_bundle_id is not None
+        if (self.kind == StateAllocationKind.RESTORED) != has_restore_source:
+            raise ValueError("state allocation kind and restore source are inconsistent")
+        if self.status == StateAllocationStatus.READY:
+            valid = self.ready_at is not None and self.retired_at is None
+        elif self.status == StateAllocationStatus.RETIRED:
+            valid = self.ready_at is None and self.retired_at is not None
+        else:
+            valid = self.ready_at is None and self.retired_at is None
+        if not valid:
+            raise ValueError("state allocation status and timestamps are inconsistent")
+        return self
+
+
 class PersistedSecretReferenceAuthority(_RuntimeRepositoryInput):
     secret_reference_id: Identifier
     provider_id: Literal["local-file-v1"]
@@ -319,6 +356,31 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         lease_owner: Identifier,
         lease_generation: int,
     ) -> PersistedLaunchAuthority: ...
+
+    def begin_state_provisioning(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> StateAllocationPreparationMaterial: ...
+
+    def complete_state_provisioning(
+        self,
+        job_id: Identifier,
+        state_allocation_id: Identifier,
+        expected_generation: int,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> StateAllocationPreparationMaterial: ...
+
+    def quarantine_state_allocation(
+        self,
+        job_id: Identifier,
+        state_allocation_id: Identifier,
+        expected_generation: int,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> StateAllocationPreparationMaterial: ...
 
     def assert_current_lease(
         self,
@@ -533,6 +595,120 @@ class SqlRuntimeRepository:
                 return self._build_launch_authority(rows)
             except (TypeError, ValueError, ValidationError):
                 raise RuntimeDataError("invalid_launch_authority") from None
+
+    def begin_state_provisioning(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> StateAllocationPreparationMaterial:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance, allocation, active_attempt = self._lock_state_preparation_records(
+                session,
+                job_id,
+            )
+            self._require_state_preparation_context(
+                session,
+                job,
+                instance,
+                allocation,
+                active_attempt,
+                self._now(),
+                validated_owner,
+                validated_generation,
+            )
+            if allocation.status == StateAllocationStatus.RESERVED:
+                allocation.status = StateAllocationStatus.PROVISIONING
+            elif allocation.status not in {
+                StateAllocationStatus.PROVISIONING,
+                StateAllocationStatus.READY,
+            }:
+                raise RuntimeInvalidTransition("state_allocation_not_transitionable")
+            return self._state_preparation_material(allocation)
+
+    def complete_state_provisioning(
+        self,
+        job_id: Identifier,
+        state_allocation_id: Identifier,
+        expected_generation: int,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> StateAllocationPreparationMaterial:
+        validated_allocation_id = _IDENTIFIER_ADAPTER.validate_python(state_allocation_id)
+        validated_state_generation = self._validate_state_generation(expected_generation)
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_lease_generation = self._validate_lease_generation(lease_generation)
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance, allocation, active_attempt = self._lock_state_preparation_records(
+                session,
+                job_id,
+            )
+            now = self._now()
+            self._require_state_preparation_context(
+                session,
+                job,
+                instance,
+                allocation,
+                active_attempt,
+                now,
+                validated_owner,
+                validated_lease_generation,
+            )
+            self._require_state_allocation_identity(
+                allocation,
+                validated_allocation_id,
+                validated_state_generation,
+            )
+            if allocation.status == StateAllocationStatus.PROVISIONING:
+                allocation.status = StateAllocationStatus.READY
+                allocation.ready_at = now
+            elif allocation.status != StateAllocationStatus.READY:
+                raise RuntimeInvalidTransition("state_allocation_not_transitionable")
+            return self._state_preparation_material(allocation)
+
+    def quarantine_state_allocation(
+        self,
+        job_id: Identifier,
+        state_allocation_id: Identifier,
+        expected_generation: int,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> StateAllocationPreparationMaterial:
+        validated_allocation_id = _IDENTIFIER_ADAPTER.validate_python(state_allocation_id)
+        validated_state_generation = self._validate_state_generation(expected_generation)
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_lease_generation = self._validate_lease_generation(lease_generation)
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance, allocation, active_attempt = self._lock_state_preparation_records(
+                session,
+                job_id,
+            )
+            self._require_state_preparation_context(
+                session,
+                job,
+                instance,
+                allocation,
+                active_attempt,
+                self._now(),
+                validated_owner,
+                validated_lease_generation,
+            )
+            self._require_state_allocation_identity(
+                allocation,
+                validated_allocation_id,
+                validated_state_generation,
+            )
+            if allocation.status in {
+                StateAllocationStatus.PROVISIONING,
+                StateAllocationStatus.READY,
+            }:
+                allocation.status = StateAllocationStatus.QUARANTINED
+                allocation.ready_at = None
+            elif allocation.status != StateAllocationStatus.QUARANTINED:
+                raise RuntimeInvalidTransition("state_allocation_not_transitionable")
+            return self._state_preparation_material(allocation)
 
     @staticmethod
     def _launch_authority_rows(
@@ -1739,6 +1915,124 @@ class SqlRuntimeRepository:
             raise RuntimeNotFound("runtime_instance_not_found")
         return job, instance
 
+    @classmethod
+    def _lock_state_preparation_records(
+        cls,
+        session: Session,
+        job_id: Identifier,
+    ) -> tuple[
+        RuntimeLifecycleJobRecord,
+        RuntimeInstanceRecord,
+        StateAllocationRecord,
+        RuntimeAttemptRecord | None,
+    ]:
+        job, instance = cls._lock_job_and_instance(session, job_id)
+        allocation = session.scalar(
+            select(StateAllocationRecord)
+            .where(
+                StateAllocationRecord.state_allocation_id == instance.state_allocation_id
+            )
+            .with_for_update()
+        )
+        if allocation is None:
+            raise RuntimeNotFound("state_allocation_not_found")
+        active_attempt = cls._lock_active_attempt(session, instance.instance_id)
+        return job, instance, allocation, active_attempt
+
+    @classmethod
+    def _require_state_preparation_context(
+        cls,
+        session: Session,
+        job: RuntimeLifecycleJobRecord,
+        instance: RuntimeInstanceRecord,
+        allocation: StateAllocationRecord,
+        active_attempt: RuntimeAttemptRecord | None,
+        now: datetime,
+        lease_owner: str,
+        lease_generation: int,
+    ) -> None:
+        cls._require_current_lease(job, now, lease_owner, lease_generation)
+        if job.status != RuntimeJobStatus.CLAIMED:
+            raise RuntimeInvalidTransition("state_preparation_job_not_claimed")
+        if job.requested_action not in {"start", "retry"}:
+            raise RuntimeInvalidTransition("state_preparation_requires_start_or_retry_job")
+        if instance.optimistic_version != job.expected_instance_version + 1:
+            raise RuntimeInvalidTransition("state_preparation_instance_version_mismatch")
+        if (
+            instance.management_mode != RuntimeManagementMode.SUPERVISOR
+            or instance.retired_at is not None
+            or instance.failure_latched
+            or instance.desired_state != RuntimeDesiredState.RUNNING
+        ):
+            raise RuntimeInvalidTransition("state_preparation_instance_not_launchable")
+        allowed_lifecycle_statuses = (
+            {RuntimeLifecycleStatus.REGISTERED, RuntimeLifecycleStatus.STOPPED}
+            if job.requested_action == RuntimeAction.START
+            else {RuntimeLifecycleStatus.FAILED}
+        )
+        if instance.lifecycle_status not in allowed_lifecycle_statuses:
+            raise RuntimeInvalidTransition("state_preparation_instance_not_launchable")
+        if (
+            allocation.state_allocation_id != instance.state_allocation_id
+            or allocation.instance_id != instance.instance_id
+            or allocation.provider_id != "managed-local-v1"
+            or allocation.relative_path
+            != f"ft_userdata/runtime/instances/{instance.instance_id}"
+        ):
+            raise RuntimeInvalidTransition("state_allocation_correlation_mismatch")
+        runtime_spec = session.get(
+            RuntimeSpecRevisionRecord,
+            instance.runtime_spec_revision_id,
+        )
+        if runtime_spec is None:
+            raise RuntimeDataError("runtime_spec_not_found")
+        runtime_spec_payload = cls._runtime_spec_payload(runtime_spec.canonical_payload)
+        if (
+            runtime_spec.state_allocation_id != allocation.state_allocation_id
+            or runtime_spec_payload.state_allocation_id != allocation.state_allocation_id
+            or runtime_spec_payload.state_layout_id != allocation.layout_id
+            or (
+                allocation.kind == StateAllocationKind.RESTORED
+            )
+            != (allocation.restore_source_bundle_id is not None)
+        ):
+            raise RuntimeInvalidTransition("state_allocation_correlation_mismatch")
+        cls._state_preparation_material(allocation)
+        if active_attempt is not None:
+            raise RuntimeInvalidTransition("state_preparation_active_attempt")
+
+    @staticmethod
+    def _require_state_allocation_identity(
+        allocation: StateAllocationRecord,
+        state_allocation_id: str,
+        expected_generation: int,
+    ) -> None:
+        if allocation.state_allocation_id != state_allocation_id:
+            raise RuntimeInvalidTransition("state_allocation_mismatch")
+        if allocation.generation != expected_generation:
+            raise RuntimeInvalidTransition("state_allocation_generation_mismatch")
+
+    @staticmethod
+    def _state_preparation_material(
+        allocation: StateAllocationRecord,
+    ) -> StateAllocationPreparationMaterial:
+        return _registry_view(
+            lambda: StateAllocationPreparationMaterial(
+                state_allocation_id=allocation.state_allocation_id,
+                instance_id=allocation.instance_id,
+                layout_id=allocation.layout_id,
+                provider_id=allocation.provider_id,
+                relative_path=allocation.relative_path,
+                kind=allocation.kind,
+                status=allocation.status,
+                generation=allocation.generation,
+                restore_source_bundle_id=allocation.restore_source_bundle_id,
+                created_at=_aware_utc(allocation.created_at),
+                ready_at=_aware_utc(allocation.ready_at),
+                retired_at=_aware_utc(allocation.retired_at),
+            )
+        )
+
     @staticmethod
     def _lock_active_attempt(
         session: Session,
@@ -1792,6 +2086,12 @@ class SqlRuntimeRepository:
         ):
             raise RuntimeInvalidTransition("invalid_lease_generation")
         return lease_generation
+
+    @staticmethod
+    def _validate_state_generation(generation: int) -> int:
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            raise RuntimeInvalidTransition("invalid_state_allocation_generation")
+        return generation
 
     @staticmethod
     def _prepared_attempt_identity(

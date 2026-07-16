@@ -56,6 +56,9 @@ LEASE_GENERATION_MIGRATION_PATH = (
 STALE_JOB_INDEX_MIGRATION_PATH = (
     MIGRATIONS_ROOT / "versions" / "20260717_0006_runtime_stale_job_index.py"
 )
+STATE_TIMESTAMPS_MIGRATION_PATH = (
+    MIGRATIONS_ROOT / "versions" / "20260717_0007_state_allocation_timestamps.py"
+)
 
 EXPECTED_COLUMNS = {
     "platform_catalog_revisions": {
@@ -842,7 +845,7 @@ def test_test_url_fallback_upgrade_commits_registry_head(postgres_url: str) -> N
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0007"
             )
     finally:
         engine.dispose()
@@ -956,7 +959,7 @@ def test_caller_search_path_cannot_redirect_migration_state(postgres_url: str) -
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM public.alembic_version"
             ).scalar_one()
-        assert version == "20260717_0006"
+        assert version == "20260717_0007"
     finally:
         with engine.begin() as connection:
             connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {shadow_schema} CASCADE")
@@ -1440,7 +1443,7 @@ def test_lease_generation_migration_blocks_concurrent_legacy_claim(
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0007"
             )
             row = connection.exec_driver_sql(
                 "SELECT status, lease_generation FROM public.runtime_lifecycle_jobs "
@@ -1499,7 +1502,7 @@ def test_lease_generation_migration_normalizes_legacy_health_and_guards_downgrad
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0007"
             )
         preserved = SqlRuntimeRepository(engine).get_latest_attempt_material("instance-1")
         assert preserved is not None
@@ -1534,7 +1537,7 @@ def test_lease_generation_downgrade_rejects_nonzero_generation_without_legacy_he
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260717_0006"
+                == "20260717_0007"
             )
             generation = connection.exec_driver_sql(
                 "SELECT lease_generation FROM public.runtime_lifecycle_jobs "
@@ -1556,7 +1559,7 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     assert migration["revision"] == "20260714_0004"
     assert migration["down_revision"] == "20260714_0003"
     assert ScriptDirectory.from_config(Config(str(ALEMBIC_CONFIG_PATH))).get_heads() == [
-        "20260717_0006"
+        "20260717_0007"
     ]
 
     lease_migration = runpy.run_path(str(LEASE_GENERATION_MIGRATION_PATH))
@@ -1566,6 +1569,12 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     stale_index_migration = runpy.run_path(str(STALE_JOB_INDEX_MIGRATION_PATH))
     assert stale_index_migration["revision"] == "20260717_0006"
     assert stale_index_migration["down_revision"] == "20260717_0005"
+    state_timestamps_migration = runpy.run_path(str(STATE_TIMESTAMPS_MIGRATION_PATH))
+    assert state_timestamps_migration["revision"] == "20260717_0007"
+    assert state_timestamps_migration["down_revision"] == "20260717_0006"
+    assert "ready_at IS NOT NULL" in state_timestamps_migration[
+        "_STATUS_TIMESTAMPS_CHECK"
+    ]
 
 
 def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
@@ -1617,6 +1626,72 @@ def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
         engine.dispose()
 
 
+def test_state_timestamp_migration_fails_closed_then_preserves_repaired_allocation(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260717_0006")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(
+                tables["state_allocations"]
+                .update()
+                .where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+                .values(status="ready", ready_at=None)
+            )
+
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="ck_state_allocations_status_timestamps",
+        ):
+            command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar_one() == "20260717_0006"
+
+        with engine.begin() as connection:
+            connection.execute(
+                tables["state_allocations"]
+                .update()
+                .where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+                .values(ready_at=datetime(2026, 7, 17, tzinfo=UTC))
+            )
+        command.upgrade(config, "head")
+        assert "ck_state_allocations_status_timestamps" in {
+            check["name"]
+            for check in inspect(engine).get_check_constraints("state_allocations")
+        }
+
+        command.downgrade(config, "20260717_0006")
+        with engine.connect() as connection:
+            row = connection.execute(
+                select(
+                    tables["state_allocations"].c.status,
+                    tables["state_allocations"].c.ready_at,
+                ).where(
+                    tables["state_allocations"].c.state_allocation_id
+                    == "state-allocation-1"
+                )
+            ).one()
+        assert row.status == "ready"
+        assert row.ready_at is not None
+        assert "ck_state_allocations_status_timestamps" not in {
+            check["name"]
+            for check in inspect(engine).get_check_constraints("state_allocations")
+        }
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
     "starting_revision",
     [
@@ -1625,6 +1700,7 @@ def test_stale_job_index_migration_preserves_jobs_across_direct_boundary(
         "20260714_0003",
         "20260714_0004",
         "20260717_0005",
+        "20260717_0006",
         "head",
     ],
 )
@@ -1641,7 +1717,7 @@ def test_registration_migration_upgrades_supported_postgres_fixtures(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260717_0006"
+            assert version == "20260717_0007"
     finally:
         engine.dispose()
 
@@ -1706,7 +1782,7 @@ def test_registration_migration_refuses_populated_downgrade_and_preserves_audit(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260717_0006"
+            assert version == "20260717_0007"
             assert connection.execute(
                 select(audit.c.action).where(
                     audit.c.audit_event_id == "audit-register-phase2-spot-paper-probe"

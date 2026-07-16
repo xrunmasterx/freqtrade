@@ -46,6 +46,7 @@ from freqtrade.platform.runtime_repository import (
     RuntimeQueryRepository,
     RuntimeRepository,
     SqlRuntimeRepository,
+    StateAllocationPreparationMaterial,
 )
 from freqtrade.platform.runtime_service import (
     RuntimeApplicationService,
@@ -125,6 +126,7 @@ __all__ = [
     "SqlTemplateRepository",
     "StateAllocation",
     "StateAllocationKind",
+    "StateAllocationPreparationMaterial",
     "StateAllocationStatus",
     "StaticCatalogRepository",
     "TemplateStatus",

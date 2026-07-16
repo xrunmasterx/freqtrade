@@ -97,6 +97,13 @@ class StateAllocationRecord(PlatformBase):
             name="ck_state_allocations_generation",
         ),
         CheckConstraint(
+            "(status = 'ready' AND ready_at IS NOT NULL AND retired_at IS NULL) OR "
+            "(status IN ('reserved', 'provisioning', 'quarantined') "
+            "AND ready_at IS NULL AND retired_at IS NULL) OR "
+            "(status = 'retired' AND ready_at IS NULL AND retired_at IS NOT NULL)",
+            name="ck_state_allocations_status_timestamps",
+        ),
+        CheckConstraint(
             "instance_id <> '' AND "
             "replace(instance_id, '/', '') = instance_id AND "
             "replace(instance_id, '\\', '') = instance_id AND "
