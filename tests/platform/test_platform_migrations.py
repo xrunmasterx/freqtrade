@@ -1472,6 +1472,7 @@ def test_lease_generation_migration_normalizes_legacy_health_and_guards_downgrad
         assert recovery.health_result.attempts == 1
         assert recovery.health_result.result_code == "health_probe_healthy"
         assert recovery.health_result.last_failure_code is None
+        assert recovery.health_result.observed_at == datetime(1970, 1, 1, tzinfo=UTC)
         generation_column = next(
             column
             for column in inspect(engine).get_columns("runtime_lifecycle_jobs")
@@ -1549,6 +1550,7 @@ def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     lease_migration = runpy.run_path(str(LEASE_GENERATION_MIGRATION_PATH))
     assert lease_migration["revision"] == "20260717_0005"
     assert lease_migration["down_revision"] == "20260714_0004"
+    assert "'observed_at'" in lease_migration["_NORMALIZE_LEGACY_HEALTH_SQL"]
 
 
 @pytest.mark.parametrize(

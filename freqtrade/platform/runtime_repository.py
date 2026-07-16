@@ -161,9 +161,17 @@ class PersistedHealthResult(_RuntimeRepositoryInput):
     profile_digest: _PayloadDigest
     deadline_at: AwareDatetime
     next_probe_not_before: AwareDatetime
+    observed_at: AwareDatetime
     attempts: Annotated[int, Field(strict=True, ge=1)]
     result_code: HealthProbeResultCode
     last_failure_code: Identifier | None
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_utc_observed_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("observed_at must be UTC")
+        return value.astimezone(UTC)
 
     @model_validator(mode="after")
     def require_result_failure_consistency(self) -> "PersistedHealthResult":
@@ -822,33 +830,34 @@ class SqlRuntimeRepository:
     ) -> PersistedHealthResult:
         validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
         validated_generation = self._validate_lease_generation(lease_generation)
-        try:
-            base = PersistedHealthResult(
-                profile_id=profile_id,
-                profile_digest=profile_digest,
-                deadline_at=deadline_at,
-                next_probe_not_before=next_probe_not_before,
-                attempts=1,
-                result_code="health_probe_reserved",
-                last_failure_code=None,
-            )
-        except ValidationError:
-            raise RuntimeInvalidTransition("invalid_health_probe_reservation") from None
-        base = base.model_copy(
-            update={
-                "deadline_at": base.deadline_at.astimezone(UTC),
-                "next_probe_not_before": base.next_probe_not_before.astimezone(UTC),
-            }
-        )
-        if base.next_probe_not_before > base.deadline_at:
-            raise RuntimeInvalidTransition("health_probe_after_deadline")
-
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, _, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            reservation_time = self._now()
+            try:
+                base = PersistedHealthResult(
+                    profile_id=profile_id,
+                    profile_digest=profile_digest,
+                    deadline_at=deadline_at,
+                    next_probe_not_before=next_probe_not_before,
+                    observed_at=reservation_time,
+                    attempts=1,
+                    result_code="health_probe_reserved",
+                    last_failure_code=None,
+                )
+            except ValidationError:
+                raise RuntimeInvalidTransition("invalid_health_probe_reservation") from None
+            base = base.model_copy(
+                update={
+                    "deadline_at": base.deadline_at.astimezone(UTC),
+                    "next_probe_not_before": base.next_probe_not_before.astimezone(UTC),
+                }
+            )
+            if base.next_probe_not_before > base.deadline_at:
+                raise RuntimeInvalidTransition("health_probe_after_deadline")
             self._require_health_job_attempt(
                 job,
                 attempt,
-                self._now(),
+                reservation_time,
                 validated_owner,
                 validated_generation,
             )
@@ -914,10 +923,11 @@ class SqlRuntimeRepository:
 
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, _, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            observed_at = self._now()
             self._require_health_job_attempt(
                 job,
                 attempt,
-                self._now(),
+                observed_at,
                 validated_owner,
                 validated_generation,
             )
@@ -926,8 +936,14 @@ class SqlRuntimeRepository:
                 raise RuntimeInvalidTransition("health_probe_not_reserved")
             if attempts != evidence.attempts:
                 raise RuntimeInvalidTransition("health_probe_ordinal_mismatch")
+            if result == "health_probe_healthy" and observed_at > evidence.deadline_at:
+                raise RuntimeInvalidTransition("health_probe_completed_after_deadline")
             completed = evidence.model_copy(
-                update={"result_code": result, "last_failure_code": failure}
+                update={
+                    "observed_at": observed_at,
+                    "result_code": result,
+                    "last_failure_code": failure,
+                }
             )
             attempt.health_result = completed.model_dump(mode="json")
             return self._attempt_view(attempt)
@@ -959,6 +975,8 @@ class SqlRuntimeRepository:
             health_result = _persisted_health_result(attempt.health_result)
             if health_result is None or health_result.result_code != "health_probe_healthy":
                 raise RuntimeInvalidTransition("healthy_probe_evidence_required")
+            if health_result.observed_at > health_result.deadline_at:
+                raise RuntimeInvalidTransition("healthy_probe_evidence_expired")
 
             previous_state = self._audit_state(instance)
             attempt.status = "healthy"

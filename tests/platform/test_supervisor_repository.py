@@ -766,6 +766,7 @@ def test_health_observation_is_durable_monotonic_and_does_not_finish_or_retry(
         "next_probe_not_before": (NOW + timedelta(seconds=1)).isoformat().replace(
             "+00:00", "Z"
         ),
+        "observed_at": NOW.isoformat().replace("+00:00", "Z"),
         "result_code": "health_probe_unhealthy",
         "attempts": 2,
         "last_failure_code": "connection_refused",
@@ -1020,6 +1021,58 @@ def test_latest_attempt_rejects_malformed_persisted_health_evidence(
         record = session.get(RuntimeAttemptRecord, attempt.attempt_id)
         assert record is not None
         record.health_result = {"result_code": "starting", "attempts": 0}
+
+    with pytest.raises(RuntimeDataError, match=r"^invalid_health_result$"):
+        repository.get_latest_attempt_material("instance-1")
+
+
+@pytest.mark.parametrize(
+    "health_result",
+    [
+        {
+            "profile_id": "api-ping-v1",
+            "profile_digest": "8" * 64,
+            "deadline_at": "2026-07-16T08:00:20Z",
+            "next_probe_not_before": "2026-07-16T08:00:00Z",
+            "attempts": 1,
+            "result_code": "health_probe_healthy",
+            "last_failure_code": None,
+        },
+        {
+            "profile_id": "api-ping-v1",
+            "profile_digest": "8" * 64,
+            "deadline_at": "2026-07-16T08:00:20Z",
+            "next_probe_not_before": "2026-07-16T08:00:00Z",
+            "observed_at": "2026-07-16T16:00:01+08:00",
+            "attempts": 1,
+            "result_code": "health_probe_healthy",
+            "last_failure_code": None,
+        },
+        {
+            "profile_id": "api-ping-v1",
+            "profile_digest": "8" * 64,
+            "deadline_at": "2026-07-16T08:00:20Z",
+            "next_probe_not_before": "2026-07-16T08:00:00Z",
+            "observed_at": "2026-07-16T08:00:01Z",
+            "attempts": 1,
+            "result_code": "health_probe_healthy",
+            "last_failure_code": None,
+            "unexpected": "field",
+        },
+    ],
+    ids=["missing-observed-at", "non-utc-observed-at", "extra-field"],
+)
+def test_latest_attempt_health_evidence_mapping_is_strict(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+    health_result: dict[str, object],
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    with Session(engine) as session, session.begin():
+        record = session.get(RuntimeAttemptRecord, attempt.attempt_id)
+        assert record is not None
+        record.health_result = health_result
 
     with pytest.raises(RuntimeDataError, match=r"^invalid_health_result$"):
         repository.get_latest_attempt_material("instance-1")
@@ -1347,6 +1400,132 @@ def test_record_healthy_binds_job_and_attempt_and_completes_atomically(
     assert record.health_result["result_code"] == "health_probe_healthy"
 
 
+def test_late_healthy_observation_is_rejected_without_mutation(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    deadline = NOW + timedelta(seconds=20)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        deadline,
+        NOW,
+        **_lease_args(running_job),
+    )
+    assert reservation.observed_at == NOW
+    clock.now = deadline + timedelta(microseconds=1)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^health_probe_completed_after_deadline$",
+    ):
+        repository.record_health_observation(
+            running_job.job_id,
+            attempt.attempt_id,
+            "health_probe_healthy",
+            reservation.attempts,
+            None,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_completed_observation_overwrites_reservation_timestamp_atomically(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(running_job),
+    )
+    assert reservation.observed_at == NOW
+    clock.now = NOW + timedelta(seconds=1)
+
+    repository.record_health_observation(
+        running_job.job_id,
+        attempt.attempt_id,
+        "health_probe_healthy",
+        reservation.attempts,
+        None,
+        **_lease_args(running_job),
+    )
+
+    recovery = repository.get_latest_attempt_material("instance-1")
+    assert recovery is not None
+    assert recovery.health_result is not None
+    assert recovery.health_result.observed_at == NOW + timedelta(seconds=1)
+    with Session(engine) as session:
+        persisted = session.get(RuntimeAttemptRecord, attempt.attempt_id)
+        assert persisted is not None
+        assert persisted.health_result is not None
+        assert persisted.health_result["observed_at"] == "2026-07-16T08:00:01Z"
+
+
+def test_persisted_late_healthy_evidence_cannot_be_adopted_after_restart(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    deadline = NOW + timedelta(seconds=20)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        deadline,
+        NOW,
+        **_lease_args(running_job),
+    )
+    late_observation = deadline + timedelta(microseconds=1)
+    with Session(engine) as session, session.begin():
+        record = session.get(RuntimeAttemptRecord, attempt.attempt_id)
+        assert record is not None
+        record.health_result = {
+            **reservation.model_dump(mode="json"),
+            "observed_at": late_observation.isoformat().replace("+00:00", "Z"),
+            "result_code": "health_probe_healthy",
+        }
+    clock.now = late_observation
+
+    restarted = SqlRuntimeRepository(engine, clock=clock, id_factory=SequentialIds())
+    recovery = restarted.get_latest_attempt_material("instance-1")
+    assert recovery is not None
+    assert recovery.health_result is not None
+    assert recovery.health_result.result_code == "health_probe_healthy"
+    assert recovery.health_result.observed_at == late_observation
+    assert recovery.health_result.observed_at > recovery.health_result.deadline_at
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^healthy_probe_evidence_expired$",
+    ):
+        restarted.record_healthy(
+            running_job.job_id,
+            attempt.attempt_id,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
 @pytest.mark.parametrize(
     "evidence_result",
     [
@@ -1494,6 +1673,7 @@ def test_record_failed_preserves_durable_health_observation(
         "profile_digest": "8" * 64,
         "deadline_at": (NOW + timedelta(seconds=20)).isoformat().replace("+00:00", "Z"),
         "next_probe_not_before": NOW.isoformat().replace("+00:00", "Z"),
+        "observed_at": NOW.isoformat().replace("+00:00", "Z"),
         "result_code": "health_probe_unhealthy",
         "attempts": 1,
         "last_failure_code": "health_timeout",
