@@ -66,6 +66,11 @@ SET health_result = json_build_object(
         stopped_at,
         TIMESTAMPTZ '1970-01-01 00:00:00+00'
     ),
+    'observed_at', COALESCE(
+        stopped_at,
+        started_at,
+        TIMESTAMPTZ '1970-01-01 00:00:00+00'
+    ),
     'attempts', 1,
     'result_code', CASE
         WHEN status = 'healthy' AND health_result ->> 'result_code' = 'healthy'
