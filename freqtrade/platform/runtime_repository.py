@@ -3,7 +3,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import Engine, func, select, tuple_
 from sqlalchemy.orm import Session
 
@@ -41,6 +50,13 @@ from freqtrade.platform.template_models import (
 Clock = Callable[[], datetime]
 IdFactory = Callable[[str], str]
 CompletionStatus = Literal["succeeded", "failed"]
+HealthProbeResultCode = Literal[
+    "health_probe_reserved",
+    "health_probe_healthy",
+    "health_probe_unhealthy",
+    "health_probe_unknown",
+    "health_probe_interrupted",
+]
 _IDENTIFIER_ADAPTER = TypeAdapter(Identifier)
 _ACTIVE_ATTEMPT_STATUSES = (
     "pending",
@@ -140,9 +156,31 @@ class ResolvedRuntimeMaterial(_RuntimeRepositoryInput):
         return value
 
 
+class PersistedHealthResult(_RuntimeRepositoryInput):
+    profile_id: Identifier
+    profile_digest: _PayloadDigest
+    deadline_at: AwareDatetime
+    next_probe_not_before: AwareDatetime
+    attempts: Annotated[int, Field(strict=True, ge=1)]
+    result_code: HealthProbeResultCode
+    last_failure_code: Identifier | None
+
+    @model_validator(mode="after")
+    def require_result_failure_consistency(self) -> "PersistedHealthResult":
+        is_success_or_reservation = self.result_code in {
+            "health_probe_reserved",
+            "health_probe_healthy",
+        }
+        if is_success_or_reservation != (self.last_failure_code is None):
+            raise ValueError("health result and failure code are inconsistent")
+        return self
+
+
 class LatestAttemptMaterial(_RuntimeRepositoryInput):
     attempt_id: Identifier
     status: RuntimeAttemptStatus
+    started_at: AwareDatetime | None
+    health_result: PersistedHealthResult | None
     runtime_spec_payload_digest: _PayloadDigest
     resolved_material: ResolvedRuntimeMaterial
 
@@ -177,11 +215,20 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         lease_seconds: int,
     ) -> RuntimeJobView | None: ...
 
+    def reclaim_reconciliation_job(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_seconds: int,
+    ) -> RuntimeJobView: ...
+
     def complete_job(
         self,
         job_id: Identifier,
         status: CompletionStatus,
         failure_code: Identifier | None,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeJobView: ...
 
     def begin_attempt(
@@ -189,21 +236,62 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         job_id: Identifier,
         attempt_id: Identifier,
         resolved_material: ResolvedRuntimeMaterial,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView: ...
 
-    def prepare_attempt_id(self, job_id: Identifier) -> Identifier: ...
+    def prepare_attempt_id(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> Identifier: ...
+
+    def assert_current_lease(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> RuntimeJobView: ...
+
+    def reserve_health_probe(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        profile_id: Identifier,
+        profile_digest: _PayloadDigest,
+        deadline_at: AwareDatetime,
+        next_probe_not_before: AwareDatetime,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> PersistedHealthResult: ...
+
+    def record_health_observation(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        result_code: Identifier,
+        attempts: int,
+        last_failure_code: Identifier | None,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> RuntimeAttemptView: ...
 
     def record_reconciliation_blocked(
         self,
         job_id: Identifier,
         attempt_id: Identifier | None,
         failure_code: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeJobView: ...
 
     def record_healthy(
         self,
         job_id: Identifier,
         attempt_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView: ...
 
     def record_failed(
@@ -211,6 +299,8 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         job_id: Identifier,
         attempt_id: Identifier,
         failure_code: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView: ...
 
     def record_stopped(
@@ -218,12 +308,15 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         job_id: Identifier,
         attempt_id: Identifier,
         exit_code: int | None,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView: ...
 
     def renew_lease(
         self,
         job_id: Identifier,
         lease_owner: Identifier,
+        lease_generation: int,
         lease_seconds: int,
     ) -> RuntimeJobView: ...
 
@@ -231,6 +324,8 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         self,
         job_id: Identifier,
         failure_code: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeJobView: ...
 
     def append_audit(self, event: RuntimeAuditEvent) -> None: ...
@@ -263,6 +358,15 @@ def _health_result_summary(evidence: object) -> str | None:
     try:
         return _IDENTIFIER_ADAPTER.validate_python(result_code)
     except ValidationError:
+        raise RuntimeDataError("invalid_health_result") from None
+
+
+def _persisted_health_result(evidence: object) -> PersistedHealthResult | None:
+    if evidence is None:
+        return None
+    try:
+        return PersistedHealthResult.model_validate(evidence)
+    except (TypeError, ValueError, ValidationError):
         raise RuntimeDataError("invalid_health_result") from None
 
 
@@ -355,6 +459,8 @@ class SqlRuntimeRepository:
                 lambda: LatestAttemptMaterial(
                     attempt_id=attempt.attempt_id,
                     status=RuntimeAttemptStatus(attempt.status),
+                    started_at=_aware_utc(attempt.started_at),
+                    health_result=_persisted_health_result(attempt.health_result),
                     runtime_spec_payload_digest=runtime_spec.payload_digest,
                     resolved_material=ResolvedRuntimeMaterial(
                         runtime_spec_revision_id=attempt.runtime_spec_revision_id,
@@ -431,6 +537,7 @@ class SqlRuntimeRepository:
                 expected_instance_version=command.expected_instance_version,
                 status=status,
                 lease_owner=None,
+                lease_generation=0,
                 lease_expires_at=None,
                 requested_at=now,
                 started_at=None,
@@ -471,13 +578,13 @@ class SqlRuntimeRepository:
             or not 1 <= lease_seconds <= 3600
         ):
             raise RuntimeInvalidTransition("invalid_lease_seconds")
-        now = self._now()
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            selection_time = self._now()
             expired = session.scalar(
                 select(RuntimeLifecycleJobRecord)
                 .where(
                     RuntimeLifecycleJobRecord.status.in_(_LEASED_JOB_STATUSES),
-                    RuntimeLifecycleJobRecord.lease_expires_at <= now,
+                    RuntimeLifecycleJobRecord.lease_expires_at <= selection_time,
                 )
                 .order_by(
                     RuntimeLifecycleJobRecord.lease_expires_at,
@@ -487,6 +594,7 @@ class SqlRuntimeRepository:
                 .limit(1)
             )
             if expired is not None:
+                now = self._now()
                 self._mark_reconciliation(session, expired, validated_owner, now)
                 return self._job_view(expired)
 
@@ -503,11 +611,54 @@ class SqlRuntimeRepository:
             job = session.scalar(statement)
             if job is None:
                 return None
+            now = self._now()
             job.status = "claimed"
             job.started_at = job.started_at or now
             job.lease_owner = validated_owner
+            job.lease_generation += 1
             job.lease_expires_at = now + timedelta(seconds=lease_seconds)
             self._append_job_audit(session, job, validated_owner, "claimed", now)
+            return self._job_view(job)
+
+    def reclaim_reconciliation_job(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_seconds: int,
+    ) -> RuntimeJobView:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        self._validate_lease_seconds(lease_seconds)
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, _ = self._lock_job_and_instance(session, job_id)
+            if job.status != "needs_reconciliation" or job.failure_code != "stale_lease":
+                raise RuntimeInvalidTransition("stale_lease_reconciliation_required")
+            now = self._now()
+            job.status = "running"
+            job.lease_owner = validated_owner
+            job.lease_generation += 1
+            job.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            job.completed_at = None
+            job.failure_code = None
+            self._append_job_audit(
+                session,
+                job,
+                validated_owner,
+                "reconciliation_reclaimed",
+                now,
+            )
+            return self._job_view(job)
+
+    def assert_current_lease(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> RuntimeJobView:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, _ = self._lock_job_and_instance(session, job_id)
+            self._require_current_lease(job, self._now(), validated_owner, validated_generation)
             return self._job_view(job)
 
     def complete_job(
@@ -515,8 +666,12 @@ class SqlRuntimeRepository:
         job_id: Identifier,
         status: CompletionStatus,
         failure_code: Identifier | None,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeJobView:
         _IDENTIFIER_ADAPTER.validate_python(job_id)
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         if status not in {"succeeded", "failed"}:
             raise RuntimeInvalidTransition("invalid_completion_status")
         if status == "succeeded" and failure_code is not None:
@@ -526,7 +681,6 @@ class SqlRuntimeRepository:
         validated_failure_code = (
             _IDENTIFIER_ADAPTER.validate_python(failure_code) if failure_code is not None else None
         )
-        now = self._now()
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job = session.scalar(
                 select(RuntimeLifecycleJobRecord)
@@ -535,17 +689,21 @@ class SqlRuntimeRepository:
             )
             if job is None:
                 raise RuntimeNotFound("runtime_job_not_found")
+            now = self._now()
             if job.status == "running":
                 raise RuntimeInvalidTransition("attempt_transition_required")
             if job.status not in _LEASED_JOB_STATUSES:
                 raise RuntimeInvalidTransition("job_not_completable")
 
-            actor = job.lease_owner or "runtime_supervisor"
+            actor = self._require_lease_identity(
+                job,
+                validated_owner,
+                validated_generation,
+            )
             lease_expires_at = _aware_utc(job.lease_expires_at)
             if lease_expires_at is None or lease_expires_at <= now:
                 self._mark_reconciliation(session, job, actor, now)
                 return self._job_view(job)
-
             job.status = status
             job.completed_at = now
             job.failure_code = validated_failure_code
@@ -554,12 +712,19 @@ class SqlRuntimeRepository:
             self._append_job_audit(session, job, actor, status, now)
             return self._job_view(job)
 
-    def prepare_attempt_id(self, job_id: Identifier) -> Identifier:
+    def prepare_attempt_id(
+        self,
+        job_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> Identifier:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         with Session(self._engine) as session, session.begin():
             job, instance = self._lock_job_and_instance(session, job_id)
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
             now = self._now()
-            self._require_current_lease(job, now)
+            self._require_current_lease(job, now, validated_owner, validated_generation)
             if job.requested_action not in {"start", "retry"}:
                 raise RuntimeInvalidTransition("attempt_requires_start_or_retry_job")
             if active_attempt is not None:
@@ -571,8 +736,12 @@ class SqlRuntimeRepository:
         job_id: Identifier,
         attempt_id: Identifier,
         resolved_material: ResolvedRuntimeMaterial,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView:
         validated_attempt_id = _IDENTIFIER_ADAPTER.validate_python(attempt_id)
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         if not isinstance(resolved_material, ResolvedRuntimeMaterial):
             raise RuntimeInvalidTransition("resolved_material_type_required")
         validated_material = self._revalidate_resolved_material(resolved_material)
@@ -581,7 +750,12 @@ class SqlRuntimeRepository:
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
             self._validate_resolved_material(session, instance, validated_material)
             now = self._now()
-            actor = self._require_current_lease(job, now)
+            actor = self._require_current_lease(
+                job,
+                now,
+                validated_owner,
+                validated_generation,
+            )
             if job.requested_action not in {"start", "retry"}:
                 raise RuntimeInvalidTransition("attempt_requires_start_or_retry_job")
             if active_attempt is not None:
@@ -635,25 +809,159 @@ class SqlRuntimeRepository:
             )
             return self._attempt_view(attempt)
 
+    def reserve_health_probe(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        profile_id: Identifier,
+        profile_digest: _PayloadDigest,
+        deadline_at: AwareDatetime,
+        next_probe_not_before: AwareDatetime,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> PersistedHealthResult:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
+        try:
+            base = PersistedHealthResult(
+                profile_id=profile_id,
+                profile_digest=profile_digest,
+                deadline_at=deadline_at,
+                next_probe_not_before=next_probe_not_before,
+                attempts=1,
+                result_code="health_probe_reserved",
+                last_failure_code=None,
+            )
+        except ValidationError:
+            raise RuntimeInvalidTransition("invalid_health_probe_reservation") from None
+        base = base.model_copy(
+            update={
+                "deadline_at": base.deadline_at.astimezone(UTC),
+                "next_probe_not_before": base.next_probe_not_before.astimezone(UTC),
+            }
+        )
+        if base.next_probe_not_before > base.deadline_at:
+            raise RuntimeInvalidTransition("health_probe_after_deadline")
+
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, _, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            self._require_health_job_attempt(
+                job,
+                attempt,
+                self._now(),
+                validated_owner,
+                validated_generation,
+            )
+            previous = _persisted_health_result(attempt.health_result)
+            if previous is not None and previous.result_code == "health_probe_reserved":
+                raise RuntimeInvalidTransition("health_probe_already_reserved")
+            if previous is not None and (
+                previous.profile_id,
+                previous.profile_digest,
+                previous.deadline_at,
+            ) != (
+                base.profile_id,
+                base.profile_digest,
+                base.deadline_at,
+            ):
+                raise RuntimeInvalidTransition("health_profile_mismatch")
+            if (
+                previous is not None
+                and base.next_probe_not_before < previous.next_probe_not_before
+            ):
+                raise RuntimeInvalidTransition("health_probe_schedule_regression")
+            attempts = 1 if previous is None else previous.attempts + 1
+            evidence = base.model_copy(update={"attempts": attempts})
+            attempt.health_result = evidence.model_dump(mode="json")
+            return evidence
+
+    def record_health_observation(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        result_code: Identifier,
+        attempts: int,
+        last_failure_code: Identifier | None,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> RuntimeAttemptView:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
+        try:
+            result = _IDENTIFIER_ADAPTER.validate_python(result_code)
+            failure = (
+                _IDENTIFIER_ADAPTER.validate_python(last_failure_code)
+                if last_failure_code is not None
+                else None
+            )
+        except ValidationError:
+            raise RuntimeInvalidTransition("invalid_health_observation") from None
+        if (
+            not isinstance(attempts, int)
+            or isinstance(attempts, bool)
+            or attempts < 1
+            or result
+            not in {
+                "health_probe_healthy",
+                "health_probe_unhealthy",
+                "health_probe_unknown",
+                "health_probe_interrupted",
+            }
+            or (result == "health_probe_healthy" and failure is not None)
+            or (result != "health_probe_healthy" and failure is None)
+        ):
+            raise RuntimeInvalidTransition("invalid_health_observation")
+
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, _, attempt = self._lock_transition_records(session, job_id, attempt_id)
+            self._require_health_job_attempt(
+                job,
+                attempt,
+                self._now(),
+                validated_owner,
+                validated_generation,
+            )
+            evidence = _persisted_health_result(attempt.health_result)
+            if evidence is None or evidence.result_code != "health_probe_reserved":
+                raise RuntimeInvalidTransition("health_probe_not_reserved")
+            if attempts != evidence.attempts:
+                raise RuntimeInvalidTransition("health_probe_ordinal_mismatch")
+            completed = evidence.model_copy(
+                update={"result_code": result, "last_failure_code": failure}
+            )
+            attempt.health_result = completed.model_dump(mode="json")
+            return self._attempt_view(attempt)
+
     def record_healthy(
         self,
         job_id: Identifier,
         attempt_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
             now = self._now()
-            actor = self._require_current_lease(job, now)
+            actor = self._require_current_lease(
+                job,
+                now,
+                validated_owner,
+                validated_generation,
+            )
             if job.status != "running" or job.requested_action not in {"start", "retry"}:
                 raise RuntimeInvalidTransition("healthy_requires_running_start_or_retry_job")
             if attempt.status not in {"pending", "validating", "launching"}:
                 raise RuntimeInvalidTransition("attempt_not_health_transitionable")
             if instance.desired_state != "running":
                 raise RuntimeInvalidTransition("healthy_requires_running_desired_state")
+            health_result = _persisted_health_result(attempt.health_result)
+            if health_result is None or health_result.result_code != "health_probe_healthy":
+                raise RuntimeInvalidTransition("healthy_probe_evidence_required")
 
             previous_state = self._audit_state(instance)
             attempt.status = "healthy"
-            attempt.health_result = {"result_code": "healthy"}
             instance.lifecycle_status = "healthy"
             instance.failure_latched = False
             self._complete_leased_job(job, "succeeded", None, now)
@@ -675,12 +983,21 @@ class SqlRuntimeRepository:
         job_id: Identifier,
         attempt_id: Identifier,
         failure_code: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView:
         validated_failure_code = _IDENTIFIER_ADAPTER.validate_python(failure_code)
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
             now = self._now()
-            actor = self._require_current_lease(job, now)
+            actor = self._require_current_lease(
+                job,
+                now,
+                validated_owner,
+                validated_generation,
+            )
             if job.status != "running" or job.requested_action not in {"start", "retry"}:
                 raise RuntimeInvalidTransition("failed_requires_running_start_or_retry_job")
             if attempt.status not in _ACTIVE_ATTEMPT_STATUSES:
@@ -711,16 +1028,27 @@ class SqlRuntimeRepository:
         job_id: Identifier,
         attempt_id: Identifier | None,
         failure_code: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeJobView:
         validated_attempt_id = (
             _IDENTIFIER_ADAPTER.validate_python(attempt_id) if attempt_id is not None else None
         )
         validated_failure_code = _IDENTIFIER_ADAPTER.validate_python(failure_code)
+        if validated_failure_code == "stale_lease":
+            raise RuntimeInvalidTransition("reserved_reconciliation_failure_code")
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance = self._lock_job_and_instance(session, job_id)
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
             now = self._now()
-            actor = self._require_current_lease(job, now)
+            actor = self._require_current_lease(
+                job,
+                now,
+                validated_owner,
+                validated_generation,
+            )
             if (
                 (active_attempt is None and validated_attempt_id is not None)
                 or (
@@ -761,15 +1089,24 @@ class SqlRuntimeRepository:
         job_id: Identifier,
         attempt_id: Identifier,
         exit_code: int | None,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeAttemptView:
         if exit_code is not None and (
             not isinstance(exit_code, int) or isinstance(exit_code, bool)
         ):
             raise RuntimeInvalidTransition("invalid_exit_code")
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
             now = self._now()
-            actor = self._require_current_lease(job, now)
+            actor = self._require_current_lease(
+                job,
+                now,
+                validated_owner,
+                validated_generation,
+            )
             if job.requested_action != "stop":
                 raise RuntimeInvalidTransition("stopped_requires_stop_job")
             if attempt.status not in _ACTIVE_ATTEMPT_STATUSES:
@@ -800,9 +1137,11 @@ class SqlRuntimeRepository:
         self,
         job_id: Identifier,
         lease_owner: Identifier,
+        lease_generation: int,
         lease_seconds: int,
     ) -> RuntimeJobView:
         validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         if (
             not isinstance(lease_seconds, int)
             or isinstance(lease_seconds, bool)
@@ -818,9 +1157,7 @@ class SqlRuntimeRepository:
                 else self._runtime_spec_template_binding(session, instance)
             )
             now = self._now()
-            self._require_current_lease(job, now)
-            if job.lease_owner != validated_owner:
-                raise RuntimeInvalidTransition("lease_owner_mismatch")
+            self._require_current_lease(job, now, validated_owner, validated_generation)
 
             job.lease_expires_at = now + timedelta(seconds=lease_seconds)
             state = self._audit_state(instance)
@@ -841,8 +1178,12 @@ class SqlRuntimeRepository:
         self,
         job_id: Identifier,
         failure_code: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
     ) -> RuntimeJobView:
         validated_failure_code = _IDENTIFIER_ADAPTER.validate_python(failure_code)
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance = self._lock_job_and_instance(session, job_id)
             active_attempt = self._lock_active_attempt(session, instance.instance_id)
@@ -852,7 +1193,12 @@ class SqlRuntimeRepository:
                 else None
             )
             now = self._now()
-            actor = self._require_current_lease(job, now)
+            actor = self._require_current_lease(
+                job,
+                now,
+                validated_owner,
+                validated_generation,
+            )
             if active_attempt is not None:
                 raise RuntimeInvalidTransition("active_attempt_requires_explicit_failure")
 
@@ -952,15 +1298,67 @@ class SqlRuntimeRepository:
         return job, instance, attempt
 
     @staticmethod
-    def _require_current_lease(job: RuntimeLifecycleJobRecord, now: datetime) -> str:
+    def _validate_lease_seconds(lease_seconds: int) -> None:
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600
+        ):
+            raise RuntimeInvalidTransition("invalid_lease_seconds")
+
+    @staticmethod
+    def _validate_lease_generation(lease_generation: int) -> int:
+        if (
+            not isinstance(lease_generation, int)
+            or isinstance(lease_generation, bool)
+            or lease_generation < 1
+        ):
+            raise RuntimeInvalidTransition("invalid_lease_generation")
+        return lease_generation
+
+    @staticmethod
+    def _require_lease_identity(
+        job: RuntimeLifecycleJobRecord,
+        lease_owner: str,
+        lease_generation: int,
+    ) -> str:
         if job.status not in _LEASED_JOB_STATUSES:
             raise RuntimeInvalidTransition("job_not_leased")
         if job.lease_owner is None:
             raise RuntimeInvalidTransition("job_lease_owner_required")
+        if job.lease_owner != lease_owner:
+            raise RuntimeInvalidTransition("lease_owner_mismatch")
+        if job.lease_generation != lease_generation:
+            raise RuntimeInvalidTransition("lease_generation_mismatch")
+        return job.lease_owner
+
+    @classmethod
+    def _require_current_lease(
+        cls,
+        job: RuntimeLifecycleJobRecord,
+        now: datetime,
+        lease_owner: str,
+        lease_generation: int,
+    ) -> str:
+        actor = cls._require_lease_identity(job, lease_owner, lease_generation)
         lease_expires_at = _aware_utc(job.lease_expires_at)
         if lease_expires_at is None or lease_expires_at <= now:
             raise RuntimeInvalidTransition("lease_expired")
-        return job.lease_owner
+        return actor
+
+    def _require_health_job_attempt(
+        self,
+        job: RuntimeLifecycleJobRecord,
+        attempt: RuntimeAttemptRecord,
+        now: datetime,
+        lease_owner: str,
+        lease_generation: int,
+    ) -> None:
+        self._require_current_lease(job, now, lease_owner, lease_generation)
+        if job.status != "running" or job.requested_action not in {"start", "retry"}:
+            raise RuntimeInvalidTransition("health_requires_running_start_or_retry_job")
+        if attempt.status not in _ACTIVE_ATTEMPT_STATUSES:
+            raise RuntimeInvalidTransition("health_requires_active_attempt")
 
     @staticmethod
     def _validate_resolved_material(
@@ -1393,6 +1791,7 @@ class SqlRuntimeRepository:
                 expected_instance_version=record.expected_instance_version,
                 status=RuntimeJobStatus(record.status),
                 lease_owner=record.lease_owner,
+                lease_generation=record.lease_generation,
                 lease_expires_at=_aware_utc(record.lease_expires_at),
                 requested_at=_aware_utc(record.requested_at),
                 started_at=_aware_utc(record.started_at),

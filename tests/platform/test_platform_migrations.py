@@ -2,6 +2,9 @@ import contextlib
 import io
 import re
 import runpy
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +31,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 
+from freqtrade.platform.runtime_repository import SqlRuntimeRepository
 from tests.platform import postgres_test_support
 from tests.platform.postgres_test_support import (
     RedactedPostgresUrl as _RedactedPostgresUrl,
@@ -45,6 +49,9 @@ ALEMBIC_CONFIG_PATH = BACKEND_ROOT / "alembic-platform.ini"
 MIGRATIONS_ROOT = BACKEND_ROOT / "platform_migrations"
 REGISTRATION_MIGRATION_PATH = (
     MIGRATIONS_ROOT / "versions" / "20260714_0004_runtime_registration.py"
+)
+LEASE_GENERATION_MIGRATION_PATH = (
+    MIGRATIONS_ROOT / "versions" / "20260717_0005_runtime_lease_generation.py"
 )
 
 EXPECTED_COLUMNS = {
@@ -99,6 +106,7 @@ EXPECTED_COLUMNS = {
         "expected_instance_version",
         "status",
         "lease_owner",
+        "lease_generation",
         "lease_expires_at",
         "requested_at",
         "started_at",
@@ -262,7 +270,7 @@ EXPECTED_STRING_LENGTHS = {
 EXPECTED_INTEGER_COLUMNS = {
     "runtime_instances": {"optimistic_version"},
     "runtime_attempts": {"attempt_number", "exit_code"},
-    "runtime_lifecycle_jobs": {"expected_instance_version"},
+    "runtime_lifecycle_jobs": {"expected_instance_version", "lease_generation"},
     "runtime_endpoints": {"internal_port"},
 }
 EXPECTED_BOOLEAN_COLUMNS = {"runtime_instances": {"failure_latched"}}
@@ -353,6 +361,7 @@ EXPECTED_CHECKS = {
     "runtime_lifecycle_jobs": {
         "ck_runtime_lifecycle_jobs_requested_action",
         "ck_runtime_lifecycle_jobs_expected_instance_version",
+        "ck_runtime_lifecycle_jobs_lease_generation",
         "ck_runtime_lifecycle_jobs_status",
     },
     "runtime_endpoints": {
@@ -509,6 +518,7 @@ def _job_values(job_id: str = "job-1", **updates: object) -> dict[str, object]:
         "expected_instance_version": 0,
         "status": "pending",
         "lease_owner": None,
+        "lease_generation": 0,
         "lease_expires_at": None,
         "requested_at": datetime(2026, 7, 12, tzinfo=UTC),
         "started_at": None,
@@ -829,7 +839,7 @@ def test_test_url_fallback_upgrade_commits_registry_head(postgres_url: str) -> N
         with engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-                == "20260714_0004"
+                == "20260717_0005"
             )
     finally:
         engine.dispose()
@@ -943,7 +953,7 @@ def test_caller_search_path_cannot_redirect_migration_state(postgres_url: str) -
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM public.alembic_version"
             ).scalar_one()
-        assert version == "20260714_0004"
+        assert version == "20260717_0005"
     finally:
         with engine.begin() as connection:
             connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {shadow_schema} CASCADE")
@@ -1309,19 +1319,247 @@ def test_alembic_head_has_no_orm_drift(postgres_url: str) -> None:
     command.check(config)
 
 
+def test_lease_generation_migration_requires_quiesced_active_jobs(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260714_0004")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        job_values = _job_values(
+            status="claimed",
+            lease_owner="supervisor-1",
+            lease_expires_at=datetime(2026, 7, 17, tzinfo=UTC),
+            started_at=datetime(2026, 7, 17, tzinfo=UTC),
+        )
+        job_values.pop("lease_generation")
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(insert(tables["runtime_lifecycle_jobs"]).values(**job_values))
+
+        with pytest.raises(
+            sqlalchemy.exc.DBAPIError,
+            match="runtime_lease_generation_requires_quiescence",
+        ):
+            command.upgrade(config, "head")
+
+        with engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+                == "20260714_0004"
+            )
+        assert "lease_generation" not in {
+            column["name"] for column in inspect(engine).get_columns("runtime_lifecycle_jobs")
+        }
+    finally:
+        engine.dispose()
+
+
+def test_lease_generation_migration_blocks_concurrent_legacy_claim(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260714_0004")
+    engine, tables = _load_tables(postgres_url)
+    attempt_lock_connection = engine.connect()
+    attempt_lock_transaction = attempt_lock_connection.begin()
+    try:
+        job_values = _job_values()
+        job_values.pop("lease_generation")
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(insert(tables["runtime_lifecycle_jobs"]).values(**job_values))
+
+        attempt_lock_connection.exec_driver_sql(
+            "LOCK TABLE public.runtime_attempts IN ACCESS SHARE MODE"
+        )
+
+        def legacy_claim() -> str | None:
+            with engine.connect() as connection:
+                transaction = connection.begin()
+                try:
+                    job_id = connection.exec_driver_sql(
+                        "SELECT job_id FROM public.runtime_lifecycle_jobs "
+                        "WHERE status = 'pending' ORDER BY requested_at, job_id "
+                        "FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ).scalar_one_or_none()
+                finally:
+                    transaction.rollback()
+                return job_id
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            migration = executor.submit(command.upgrade, config, "head")
+            claim = None
+            try:
+                deadline = time.monotonic() + 5
+                migration_has_job_lock = False
+                while time.monotonic() < deadline:
+                    with engine.connect() as connection:
+                        migration_has_job_lock = bool(
+                            connection.exec_driver_sql(
+                                "SELECT EXISTS ("
+                                "SELECT 1 FROM pg_locks AS locks "
+                                "JOIN pg_class AS relation ON relation.oid = locks.relation "
+                                "JOIN pg_namespace AS namespace "
+                                "ON namespace.oid = relation.relnamespace "
+                                "WHERE namespace.nspname = 'public' "
+                                "AND relation.relname = 'runtime_lifecycle_jobs' "
+                                "AND locks.mode = 'AccessExclusiveLock' AND locks.granted)"
+                            ).scalar_one()
+                        )
+                    if migration_has_job_lock:
+                        break
+                    time.sleep(0.01)
+                assert migration_has_job_lock
+
+                claim = executor.submit(legacy_claim)
+                with pytest.raises(FutureTimeoutError):
+                    claim.result(timeout=0.2)
+            finally:
+                if attempt_lock_transaction.is_active:
+                    attempt_lock_transaction.commit()
+
+            migration.result(timeout=5)
+            assert claim is not None
+            assert claim.result(timeout=5) == "job-1"
+
+        with engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+                == "20260717_0005"
+            )
+            row = connection.exec_driver_sql(
+                "SELECT status, lease_generation FROM public.runtime_lifecycle_jobs "
+                "WHERE job_id = 'job-1'"
+            ).one()
+        assert row == ("pending", 0)
+    finally:
+        if attempt_lock_transaction.is_active:
+            attempt_lock_transaction.rollback()
+        attempt_lock_connection.close()
+        engine.dispose()
+
+
+def test_lease_generation_migration_normalizes_legacy_health_and_guards_downgrade(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "20260714_0004")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(
+                insert(tables["runtime_attempts"]).values(
+                    **_attempt_values(
+                        status="healthy",
+                        health_result={"result_code": "healthy"},
+                        image_id=f"sha256:{'a' * 64}",
+                        started_at=None,
+                    )
+                )
+            )
+
+        command.upgrade(config, "head")
+        recovery = SqlRuntimeRepository(engine).get_latest_attempt_material("instance-1")
+        assert recovery is not None
+        assert recovery.started_at is None
+        assert recovery.health_result is not None
+        assert recovery.health_result.profile_id == "legacy-runtime-health-v1"
+        assert recovery.health_result.attempts == 1
+        assert recovery.health_result.result_code == "health_probe_healthy"
+        assert recovery.health_result.last_failure_code is None
+        generation_column = next(
+            column
+            for column in inspect(engine).get_columns("runtime_lifecycle_jobs")
+            if column["name"] == "lease_generation"
+        )
+        assert generation_column["nullable"] is False
+        assert generation_column["default"] is None
+
+        with pytest.raises(sqlalchemy.exc.DBAPIError, match="runtime_task6_downgrade_refused"):
+            command.downgrade(config, "20260714_0004")
+
+        with engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+                == "20260717_0005"
+            )
+        preserved = SqlRuntimeRepository(engine).get_latest_attempt_material("instance-1")
+        assert preserved is not None
+        assert preserved.health_result == recovery.health_result
+    finally:
+        engine.dispose()
+
+
+def test_lease_generation_downgrade_rejects_nonzero_generation_without_legacy_health(
+    postgres_url: str,
+) -> None:
+    config = _alembic_config(postgres_url)
+    command.upgrade(config, "head")
+    engine, tables = _load_tables(postgres_url)
+    try:
+        with engine.begin() as connection:
+            _seed_runtime_parent_chain(connection, tables)
+            connection.execute(insert(tables["runtime_instances"]).values(**_instance_values()))
+            connection.execute(
+                insert(tables["runtime_lifecycle_jobs"]).values(
+                    **_job_values(
+                        status="succeeded",
+                        lease_generation=1,
+                        completed_at=datetime(2026, 7, 17, tzinfo=UTC),
+                    )
+                )
+            )
+
+        with pytest.raises(sqlalchemy.exc.DBAPIError, match="runtime_task6_downgrade_refused"):
+            command.downgrade(config, "20260714_0004")
+
+        with engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
+                == "20260717_0005"
+            )
+            generation = connection.exec_driver_sql(
+                "SELECT lease_generation FROM public.runtime_lifecycle_jobs "
+                "WHERE job_id = 'job-1'"
+            ).scalar_one()
+            legacy_count = connection.exec_driver_sql(
+                "SELECT count(*) FROM public.runtime_attempts "
+                "WHERE health_result ->> 'profile_id' = 'legacy-runtime-health-v1'"
+            ).scalar_one()
+        assert generation == 1
+        assert legacy_count == 0
+    finally:
+        engine.dispose()
+
+
 def test_runtime_registration_migration_is_linear_and_single_head() -> None:
     migration = runpy.run_path(str(REGISTRATION_MIGRATION_PATH))
 
     assert migration["revision"] == "20260714_0004"
     assert migration["down_revision"] == "20260714_0003"
     assert ScriptDirectory.from_config(Config(str(ALEMBIC_CONFIG_PATH))).get_heads() == [
-        "20260714_0004"
+        "20260717_0005"
     ]
+
+    lease_migration = runpy.run_path(str(LEASE_GENERATION_MIGRATION_PATH))
+    assert lease_migration["revision"] == "20260717_0005"
+    assert lease_migration["down_revision"] == "20260714_0004"
 
 
 @pytest.mark.parametrize(
     "starting_revision",
-    ["20260712_0001", "20260712_0002", "20260714_0003", "head"],
+    [
+        "20260712_0001",
+        "20260712_0002",
+        "20260714_0003",
+        "20260714_0004",
+        "head",
+    ],
 )
 def test_registration_migration_upgrades_supported_postgres_fixtures(
     postgres_url: str,
@@ -1336,7 +1574,7 @@ def test_registration_migration_upgrades_supported_postgres_fixtures(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260714_0004"
+            assert version == "20260717_0005"
     finally:
         engine.dispose()
 
@@ -1401,7 +1639,7 @@ def test_registration_migration_refuses_populated_downgrade_and_preserves_audit(
             version = connection.exec_driver_sql(
                 "SELECT version_num FROM alembic_version"
             ).scalar_one()
-            assert version == "20260714_0004"
+            assert version == "20260717_0005"
             assert connection.execute(
                 select(audit.c.action).where(
                     audit.c.audit_event_id == "audit-register-phase2-spot-paper-probe"

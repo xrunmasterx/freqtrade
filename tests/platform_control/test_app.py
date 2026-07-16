@@ -103,6 +103,7 @@ def _job() -> RuntimeJobView:
         expected_instance_version=0,
         status="succeeded",
         lease_owner=None,
+        lease_generation=1,
         lease_expires_at=None,
         requested_at=NOW,
         started_at=NOW,
@@ -167,7 +168,8 @@ def auth_headers(client: TestClient) -> dict[str, str]:
 def test_exact_routes_openapi_methods_and_no_lifecycle_or_access_surface(
     client: TestClient,
 ) -> None:
-    paths = client.app.openapi()["paths"]
+    openapi = client.app.openapi()
+    paths = openapi["paths"]
     assert set(paths) == {
         "/api/v2/ping",
         "/api/v2/token/login",
@@ -181,6 +183,14 @@ def test_exact_routes_openapi_methods_and_no_lifecycle_or_access_surface(
     for path, operations in paths.items():
         expected = {"post"} if "/token/" in path else {"get"}
         assert set(operations) == expected
+
+    job_schema = openapi["components"]["schemas"]["RuntimeJobView"]
+    assert "lease_generation" in job_schema["required"]
+    assert job_schema["properties"]["lease_generation"] == {
+        "minimum": 0.0,
+        "title": "Lease Generation",
+        "type": "integer",
+    }
 
     for method in ("post", "put", "patch", "delete"):
         assert getattr(client, method)("/api/v2/runtime-instances").status_code == 405
@@ -331,6 +341,7 @@ def test_read_shapes_use_sql_catalog_and_exact_runtime_wrappers(
     jobs = client.get("/api/v2/runtime-instances/instance-1/jobs", headers=auth_headers).json()
     assert set(jobs) == {"instance_id", "jobs"}
     assert jobs["jobs"][0]["job_id"] == "job-1"
+    assert jobs["jobs"][0]["lease_generation"] == 1
 
 
 def test_head_executes_same_auth_and_query_boundary_but_is_schema_hidden(
