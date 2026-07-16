@@ -13,6 +13,10 @@ from freqtrade.platform.template_domain import FrozenPlatformModel
 _LowercaseSha256Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 _GitObjectId = Annotated[str, Field(pattern=r"^([0-9a-f]{40}|[0-9a-f]{64})$")]
 _InstrumentKey = Annotated[str, Field(min_length=1, max_length=256)]
+_StrategyClassName = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,127}$"),
+]
 
 
 def _canonicalize(payload: object) -> str:
@@ -57,6 +61,7 @@ class RuntimeSpecPayload(FrozenPlatformModel):
     secret_reference_ids: tuple[Identifier, ...]
     config_blob_commit: _GitObjectId
     strategy_commit: _GitObjectId
+    strategy_class_name: _StrategyClassName | None = None
     safety_policy_commit: _GitObjectId
     root_commit: _GitObjectId
     backend_commit: _GitObjectId
@@ -93,7 +98,7 @@ class RuntimeSpecRevision(FrozenPlatformModel):
         except ValidationError:
             raise ValueError("runtime_spec_payload_invalid") from None
 
-        canonical_payload = _canonicalize(payload.model_dump(mode="json"))
+        canonical_payload = _canonicalize(payload.model_dump(mode="json", exclude_none=True))
         if canonical_payload != self.canonical_payload:
             raise ValueError("runtime_spec_payload_not_canonical")
         if len(self.payload_digest) != 64 or any(
@@ -114,7 +119,9 @@ class RuntimeSpecRevision(FrozenPlatformModel):
         payload: RuntimeSpecPayload | dict[str, object],
     ) -> "RuntimeSpecRevision":
         validated_payload = RuntimeSpecPayload.model_validate(payload)
-        canonical_payload = _canonicalize(validated_payload.model_dump(mode="json"))
+        canonical_payload = _canonicalize(
+            validated_payload.model_dump(mode="json", exclude_none=True)
+        )
         payload_digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
         return cls(
             runtime_spec_revision_id=f"runtime-spec-{payload_digest}",

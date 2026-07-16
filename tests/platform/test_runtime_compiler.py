@@ -151,6 +151,7 @@ def _template_revision() -> AdapterTemplateRevisionView:
             command_policy_id="freqtrade-spot-paper-v1",
             mount_policy_ids=(
                 "runtime-config-ro-v1",
+                "safety-policy-ro-v1",
                 "strategy-ro-v1",
                 "managed-state-rw-v1",
                 "api-secrets-ro-v1",
@@ -176,12 +177,15 @@ def _template_revision() -> AdapterTemplateRevisionView:
 
 
 def _revision_for_template(template: AdapterTemplate) -> AdapterTemplateRevisionView:
-    canonical_payload = json.dumps(
-        {"schema_version": 1, **template.model_dump(mode="json")},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ) + "\n"
+    canonical_payload = (
+        json.dumps(
+            {"schema_version": 1, **template.model_dump(mode="json")},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
     digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
     base_revision = _template_revision()
     return AdapterTemplateRevisionView(
@@ -232,6 +236,7 @@ def _closed_policies() -> ClosedPolicySnapshot:
         mount_policy_ids=frozenset(
             {
                 "runtime-config-ro-v1",
+                "safety-policy-ro-v1",
                 "strategy-ro-v1",
                 "managed-state-rw-v1",
                 "api-secrets-ro-v1",
@@ -371,6 +376,7 @@ def test_paper_probe_compiles_exact_bound_runtime_spec() -> None:
         "secret-ws-token",
     ]
     assert payload["image_policy_id"] == "freqtrade-reviewed-image-v1"
+    assert payload["strategy_class_name"] == "SampleStrategy"
     assert payload["root_commit"] == ROOT_COMMIT
     assert isinstance(revision.canonical_payload, str)
 
@@ -390,7 +396,7 @@ def test_compile_has_literal_golden_canonical_json_and_digest() -> None:
         '"image_policy_id":"freqtrade-reviewed-image-v1",'
         '"instance_kind":"freqtrade",'
         '"market_scope":{"instrument_keys":[],"market_id":"digital_asset","product_ids":["spot"],"venue_ids":["bitget"]},'
-        '"mount_policy_ids":["runtime-config-ro-v1","strategy-ro-v1","managed-state-rw-v1","api-secrets-ro-v1"],'
+        '"mount_policy_ids":["runtime-config-ro-v1","safety-policy-ro-v1","strategy-ro-v1","managed-state-rw-v1","api-secrets-ro-v1"],'
         '"network_policy_id":"isolated-public-market-data-v1",'
         '"owner_ref":{"owner_id":"phase2-spot-paper-probe","owner_kind":"paper_probe","owner_revision":"phase2-spot-paper-probe-v1"},'
         '"resource_profile_id":"freqtrade-small-v1",'
@@ -401,6 +407,7 @@ def test_compile_has_literal_golden_canonical_json_and_digest() -> None:
         '"state_allocation_id":"state-paper-probe-v1",'
         '"state_layout_id":"freqtrade-state-v1",'
         '"strategies_commit":"4444444444444444444444444444444444444444",'
+        '"strategy_class_name":"SampleStrategy",'
         '"strategy_commit":"1111111111111111111111111111111111111111",'
         '"strategy_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
         '"template_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
@@ -408,7 +415,7 @@ def test_compile_has_literal_golden_canonical_json_and_digest() -> None:
 
     assert revision.canonical_payload == expected_payload
     assert revision.payload_digest == (
-        "0ce1ba3432199a37ffb568564b43b9703e8f6c44f3ab23e00595b6d69b016167"
+        "e8187a7b83f4152c34945a93a2076c8fccb9ebf875fd93f51605b93def03f3a6"
     )
     assert revision.runtime_spec_revision_id == f"runtime-spec-{revision.payload_digest}"
 
@@ -448,8 +455,7 @@ def test_workspace_worker_strategy_remains_bound_to_strategies_component() -> No
         )
     )
     secret_references = tuple(
-        reference.model_copy(update={"owner_scope": owner})
-        for reference in _secret_references()
+        reference.model_copy(update={"owner_scope": owner}) for reference in _secret_references()
     )
     values = _request_values()
     values["owner_ref"] = owner.model_dump(mode="json")
@@ -634,9 +640,7 @@ def test_validation_order_is_stable_and_stops_before_canonicalization(
         "runtime_environment_invalid",
     )
 
-    ready_state = _state_allocation().model_copy(
-        update={"status": StateAllocationStatus.READY}
-    )
+    ready_state = _state_allocation().model_copy(update={"status": StateAllocationStatus.READY})
     disabled_secrets = (
         _secret_references()[0].model_copy(update={"status": SecretReferenceStatus.DISABLED}),
         *_secret_references()[1:],

@@ -282,12 +282,9 @@ class RuntimeSpecCompiler:
             or request.environment not in template.allowed_environments
         ):
             raise RuntimeCompileError("runtime_template_invalid")
-        if (
-            request.owner_ref.owner_kind is RuntimeOwnerKind.PAPER_PROBE
-            and (
-                template.template_id != "freqtrade-paper-probe-v1"
-                or request.instance_kind != "freqtrade"
-            )
+        if request.owner_ref.owner_kind is RuntimeOwnerKind.PAPER_PROBE and (
+            template.template_id != "freqtrade-paper-probe-v1"
+            or request.instance_kind != "freqtrade"
         ):
             raise RuntimeCompileError("runtime_template_invalid")
         return revision
@@ -453,6 +450,7 @@ class RuntimeSpecCompiler:
             secret_reference_ids=secret_reference_ids,
             config_blob_commit=request.config_identity.commit,
             strategy_commit=request.strategy_identity.commit,
+            strategy_class_name=request.strategy_identity.strategy_class_name,
             safety_policy_commit=request.safety_policy_identity.commit,
             root_commit=components.root_commit,
             backend_commit=components.backend_commit,

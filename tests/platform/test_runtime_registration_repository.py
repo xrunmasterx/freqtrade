@@ -58,6 +58,7 @@ def _template() -> AdapterTemplate:
         command_policy_id="freqtrade-spot-paper-v1",
         mount_policy_ids=(
             "runtime-config-ro-v1",
+            "safety-policy-ro-v1",
             "strategy-ro-v1",
             "managed-state-rw-v1",
             "api-secrets-ro-v1",
@@ -72,12 +73,15 @@ def _template() -> AdapterTemplate:
 
 def _publication() -> CommittedTemplatePublication:
     template = _template()
-    canonical_payload = json.dumps(
-        {"schema_version": 1, **template.model_dump(mode="json")},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ) + "\n"
+    canonical_payload = (
+        json.dumps(
+            {"schema_version": 1, **template.model_dump(mode="json")},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
     return CommittedTemplatePublication(
         template=template,
         canonical_payload=canonical_payload,
@@ -108,6 +112,7 @@ def _request(template_revision_id: str) -> EnsurePaperProbeRegistrationRequest:
             "command_policy_ids": ["freqtrade-spot-paper-v1"],
             "mount_policy_ids": [
                 "runtime-config-ro-v1",
+                "safety-policy-ro-v1",
                 "strategy-ro-v1",
                 "managed-state-rw-v1",
                 "api-secrets-ro-v1",
@@ -168,11 +173,12 @@ def test_registration_is_atomic_replay_safe_and_has_no_runtime_side_effects(
         assert _count(session, RuntimeSpecRevisionRecord) == 1
         assert _count(session, RuntimeInstanceRecord) == 1
         assert session.get(RuntimeAuditEventRecord, PAPER_PROBE_AUDIT_EVENT_ID) is not None
-        assert session.scalar(
-            select(func.count()).where(
-                RuntimeAuditEventRecord.action == "register_paper_probe"
+        assert (
+            session.scalar(
+                select(func.count()).where(RuntimeAuditEventRecord.action == "register_paper_probe")
             )
-        ) == 1
+            == 1
+        )
         assert _count(session, SecretVersionMetadataRecord) == 0
         assert _count(session, RuntimeLifecycleJobRecord) == 0
         assert _count(session, RuntimeAttemptRecord) == 0
@@ -227,11 +233,12 @@ def test_registration_rejects_non_exact_catalog_and_rolls_back_all_new_rows(
         assert _count(session, SecretReferenceRecord) == 0
         assert _count(session, RuntimeSpecRevisionRecord) == 0
         assert _count(session, RuntimeInstanceRecord) == 0
-        assert session.scalar(
-            select(func.count()).where(
-                RuntimeAuditEventRecord.action == "register_paper_probe"
+        assert (
+            session.scalar(
+                select(func.count()).where(RuntimeAuditEventRecord.action == "register_paper_probe")
             )
-        ) == 0
+            == 0
+        )
 
 
 def test_registration_rejects_catalog_json_with_equal_but_different_raw_types(
@@ -300,10 +307,7 @@ def test_registration_replay_rejects_partial_or_conflicting_reserved_inputs(
         elif corruption == "ready_state":
             session.execute(
                 update(StateAllocationRecord)
-                .where(
-                    StateAllocationRecord.state_allocation_id
-                    == PAPER_PROBE_STATE_ALLOCATION_ID
-                )
+                .where(StateAllocationRecord.state_allocation_id == PAPER_PROBE_STATE_ALLOCATION_ID)
                 .values(status="ready", ready_at=NOW)
             )
         else:
@@ -326,11 +330,12 @@ def test_registration_replay_rejects_partial_or_conflicting_reserved_inputs(
         repository.ensure_paper_probe_registration(request, "operator_cli", NOW)
 
     with Session(engine) as session:
-        assert session.scalar(
-            select(func.count()).where(
-                RuntimeAuditEventRecord.action == "register_paper_probe"
+        assert (
+            session.scalar(
+                select(func.count()).where(RuntimeAuditEventRecord.action == "register_paper_probe")
             )
-        ) == 1
+            == 1
+        )
         assert session.get(RuntimeInstanceRecord, PAPER_PROBE_INSTANCE_ID) is not None
         assert session.get(RuntimeSpecRevisionRecord, expected.runtime_spec_revision_id) is not None
         if corruption == "missing_reference":
@@ -355,11 +360,12 @@ def test_registration_replay_rejects_conflicting_artifact_evidence_without_secon
 
     with Session(engine) as session:
         assert _count(session, RuntimeSpecRevisionRecord) == 1
-        assert session.scalar(
-            select(func.count()).where(
-                RuntimeAuditEventRecord.action == "register_paper_probe"
+        assert (
+            session.scalar(
+                select(func.count()).where(RuntimeAuditEventRecord.action == "register_paper_probe")
             )
-        ) == 1
+            == 1
+        )
 
 
 def test_registration_replay_rejects_corrupt_audit_provenance() -> None:
@@ -394,9 +400,7 @@ def test_registration_audit_contains_only_exact_identifiers_digests_and_commits(
         assert audit.provenance == {
             "source": "runtime_registration_repository",
             "catalog_revision_id": "builtin-market-catalog-v2",
-            "runtime_spec_digest": result.runtime_spec_revision_id.removeprefix(
-                "runtime-spec-"
-            ),
+            "runtime_spec_digest": result.runtime_spec_revision_id.removeprefix("runtime-spec-"),
             "template_digest": result.adapter_template_revision_id.removeprefix("template-"),
             "root_commit": ROOT_COMMIT,
             "backend_commit": BACKEND_COMMIT,

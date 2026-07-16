@@ -246,7 +246,10 @@ def test_runtime_spec_payload_is_exact_frozen_and_accepts_only_stable_references
     _domain, runtime_spec = _domain_modules()
     payload = runtime_spec.RuntimeSpecPayload.model_validate(_runtime_spec_payload())
 
-    assert set(type(payload).model_fields) == set(_runtime_spec_payload())
+    assert set(type(payload).model_fields) == {
+        *_runtime_spec_payload(),
+        "strategy_class_name",
+    }
     assert payload.model_config["frozen"] is True
     assert payload.model_config["extra"] == "forbid"
     assert payload.model_config["hide_input_in_errors"] is True
@@ -254,6 +257,46 @@ def test_runtime_spec_payload_is_exact_frozen_and_accepts_only_stable_references
 
     revision = runtime_spec.RuntimeSpecRevision.from_payload(payload)
     assert "secret-reference-1" in revision.canonical_payload
+
+
+def test_runtime_spec_persists_strategy_class_and_preserves_legacy_digest() -> None:
+    _domain, runtime_spec = _domain_modules()
+    current_payload = {
+        **_runtime_spec_payload(),
+        "strategy_class_name": "SampleStrategy",
+    }
+
+    current = runtime_spec.RuntimeSpecRevision.from_payload(current_payload)
+    assert json.loads(current.canonical_payload)["strategy_class_name"] == "SampleStrategy"
+
+    legacy_payload = _runtime_spec_payload()
+    legacy_canonical = json.dumps(
+        legacy_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    legacy = runtime_spec.RuntimeSpecRevision(**_runtime_spec_envelope(legacy_canonical))
+    decoded_legacy = runtime_spec.RuntimeSpecPayload.model_validate_json(legacy.canonical_payload)
+
+    assert decoded_legacy.strategy_class_name is None
+    assert legacy.canonical_payload == legacy_canonical
+    assert legacy.payload_digest == hashlib.sha256(legacy_canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("strategy_class_name", ["bad-class-name", "1Strategy", "A.B"])
+def test_runtime_spec_rejects_invalid_strategy_class_names(
+    strategy_class_name: str,
+) -> None:
+    _domain, runtime_spec = _domain_modules()
+
+    with pytest.raises(ValidationError):
+        runtime_spec.RuntimeSpecPayload.model_validate(
+            {
+                **_runtime_spec_payload(),
+                "strategy_class_name": strategy_class_name,
+            }
+        )
 
 
 @pytest.mark.parametrize(
