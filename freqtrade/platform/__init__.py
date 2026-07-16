@@ -36,6 +36,7 @@ from freqtrade.platform.runtime_registration_repository import (
     SqlPaperProbeRegistrationRepository,
 )
 from freqtrade.platform.runtime_repository import (
+    PersistedLaunchAuthority,
     RuntimeAuditEvent,
     RuntimeConflict,
     RuntimeDataError,
@@ -89,6 +90,7 @@ __all__ = [
     "PaperProbeRegistrationNotFound",
     "PaperProbeRegistrationResult",
     "PaperProbeRegistrationStatus",
+    "PersistedLaunchAuthority",
     "RuntimeAction",
     "RuntimeAuditAction",
     "RuntimeApplicationService",
