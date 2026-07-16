@@ -675,6 +675,7 @@ def test_platform_supervisor_runs_repository_lifecycle_with_bounded_authority(
                 authority.adapter_template.adapter_template_revision_id
             ),
             state_allocation_id=authority.state_allocation.state_allocation_id,
+            state_allocation_generation=authority.state_allocation.generation,
             resolved_secret_versions={
                 reference.secret_reference_id: reference.active_version_id
                 for reference in authority.secret_references
@@ -694,6 +695,17 @@ def test_platform_supervisor_runs_repository_lifecycle_with_bounded_authority(
             **lease,
         )
         assert attempt.status == "launching"
+        active_authority = repository.revalidate_active_launch_authority_material(
+            renewed.job_id,
+            attempt.attempt_id,
+            **lease,
+        )
+        assert active_authority.instance.instance_id == material.instance_id
+        assert active_authority.instance.lifecycle_status == "starting"
+        assert active_authority.runtime_spec == authority.runtime_spec
+        assert active_authority.adapter_template == authority.adapter_template
+        assert active_authority.state_allocation == authority.state_allocation
+        assert active_authority.secret_references == authority.secret_references
 
         reservation = repository.reserve_health_probe(
             renewed.job_id,

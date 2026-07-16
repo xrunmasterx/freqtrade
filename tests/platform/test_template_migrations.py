@@ -523,7 +523,7 @@ def test_nonempty_0001_upgrade_preserves_identity_and_uses_not_valid_fks(
                 for name, table in tables.items()
             }
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "20260712_0002")
 
         with engine.connect() as connection:
             after = {

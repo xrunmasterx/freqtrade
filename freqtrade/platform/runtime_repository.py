@@ -139,6 +139,7 @@ class ResolvedRuntimeMaterial(_RuntimeRepositoryInput):
     runtime_spec_revision_id: Identifier
     adapter_template_revision_id: Identifier
     state_allocation_id: Identifier
+    state_allocation_generation: Annotated[int, Field(strict=True, ge=1)]
     resolved_secret_versions: tuple[ResolvedSecretVersion, ...]
     image_id: _ImageIdentity
     root_commit: _GitObjectIdentity
@@ -350,6 +351,14 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
     ) -> Identifier: ...
 
     def resolve_launch_authority_material(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> PersistedLaunchAuthority: ...
+
+    def revalidate_active_launch_authority_material(
         self,
         job_id: Identifier,
         attempt_id: Identifier,
@@ -596,6 +605,36 @@ class SqlRuntimeRepository:
             except (TypeError, ValueError, ValidationError):
                 raise RuntimeDataError("invalid_launch_authority") from None
 
+    def revalidate_active_launch_authority_material(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier,
+        lease_owner: Identifier,
+        lease_generation: int,
+    ) -> PersistedLaunchAuthority:
+        validated_owner = _IDENTIFIER_ADAPTER.validate_python(lease_owner)
+        validated_generation = self._validate_lease_generation(lease_generation)
+        with Session(self._engine) as session, session.begin():
+            job, instance, attempt = self._lock_transition_records(
+                session,
+                job_id,
+                attempt_id,
+            )
+            self._require_active_launch_authority_context(
+                job,
+                instance,
+                attempt,
+                self._now(),
+                validated_owner,
+                validated_generation,
+            )
+            material = self._active_attempt_material(attempt)
+            return self._validate_active_resolved_material(
+                session,
+                instance,
+                material,
+            )
+
     def begin_state_provisioning(
         self,
         job_id: Identifier,
@@ -788,6 +827,46 @@ class SqlRuntimeRepository:
             ]
         ],
     ) -> PersistedLaunchAuthority:
+        return cls._build_launch_authority_with_template_policy(
+            rows,
+            allow_revoked_template=False,
+        )
+
+    @classmethod
+    def _build_active_launch_authority(
+        cls,
+        rows: list[
+            tuple[
+                RuntimeInstanceRecord,
+                RuntimeSpecRevisionRecord | None,
+                AdapterTemplateRevisionRecord | None,
+                StateAllocationRecord | None,
+                SecretReferenceRecord | None,
+                SecretVersionMetadataRecord | None,
+            ]
+        ],
+    ) -> PersistedLaunchAuthority:
+        return cls._build_launch_authority_with_template_policy(
+            rows,
+            allow_revoked_template=True,
+        )
+
+    @classmethod
+    def _build_launch_authority_with_template_policy(
+        cls,
+        rows: list[
+            tuple[
+                RuntimeInstanceRecord,
+                RuntimeSpecRevisionRecord | None,
+                AdapterTemplateRevisionRecord | None,
+                StateAllocationRecord | None,
+                SecretReferenceRecord | None,
+                SecretVersionMetadataRecord | None,
+            ]
+        ],
+        *,
+        allow_revoked_template: bool,
+    ) -> PersistedLaunchAuthority:
         instance, runtime_spec, template_record, allocation, _, _ = rows[0]
         if runtime_spec is None or template_record is None or allocation is None:
             raise ValueError("authority_parent_missing")
@@ -796,6 +875,7 @@ class SqlRuntimeRepository:
         publication, template_status, template = cls._validated_launch_template(
             template_record,
             payload,
+            allow_revoked=allow_revoked_template,
         )
         cls._validate_launch_allocation(instance, allocation, payload)
         secret_authorities = cls._launch_secret_authorities(
@@ -890,6 +970,8 @@ class SqlRuntimeRepository:
     def _validated_launch_template(
         template_record: AdapterTemplateRevisionRecord,
         payload: RuntimeSpecPayload,
+        *,
+        allow_revoked: bool = False,
     ) -> tuple[CommittedTemplatePublication, TemplateStatus, AdapterTemplate]:
         decoded_template = json.loads(template_record.canonical_payload)
         if not isinstance(decoded_template, dict) or decoded_template.get("schema_version") != 1:
@@ -913,7 +995,10 @@ class SqlRuntimeRepository:
             != f"template-{publication.payload_digest}"
             or template_record.template_id != template.template_id
             or template_record.semantic_version != template.semantic_version
-            or template_status is TemplateStatus.REVOKED
+            or (
+                template_status is TemplateStatus.REVOKED
+                and (not allow_revoked or template_record.revoked_at is None)
+            )
             or (
                 template_status is TemplateStatus.ACTIVE
                 and (
@@ -1093,7 +1178,8 @@ class SqlRuntimeRepository:
                     resolved_material=ResolvedRuntimeMaterial(
                         runtime_spec_revision_id=attempt.runtime_spec_revision_id,
                         adapter_template_revision_id=attempt.adapter_template_revision_id,
-                        state_allocation_id=runtime_spec.state_allocation_id,
+                        state_allocation_id=attempt.state_allocation_id,
+                        state_allocation_generation=attempt.state_allocation_generation,
                         resolved_secret_versions=attempt.resolved_secret_versions,
                         image_id=attempt.image_id,
                         root_commit=attempt.root_commit,
@@ -1423,6 +1509,8 @@ class SqlRuntimeRepository:
                 attempt_number=attempt_number,
                 runtime_spec_revision_id=validated_material.runtime_spec_revision_id,
                 adapter_template_revision_id=validated_material.adapter_template_revision_id,
+                state_allocation_id=validated_material.state_allocation_id,
+                state_allocation_generation=validated_material.state_allocation_generation,
                 resolved_secret_versions=self._secret_version_mapping(validated_material),
                 image_id=validated_material.image_id,
                 root_commit=validated_material.root_commit,
@@ -2164,12 +2252,66 @@ class SqlRuntimeRepository:
         if attempt.status not in _ACTIVE_ATTEMPT_STATUSES:
             raise RuntimeInvalidTransition("health_requires_active_attempt")
 
+    @classmethod
+    def _require_active_launch_authority_context(
+        cls,
+        job: RuntimeLifecycleJobRecord,
+        instance: RuntimeInstanceRecord,
+        attempt: RuntimeAttemptRecord,
+        now: datetime,
+        lease_owner: str,
+        lease_generation: int,
+    ) -> None:
+        cls._require_current_lease(job, now, lease_owner, lease_generation)
+        if job.status != RuntimeJobStatus.RUNNING:
+            raise RuntimeInvalidTransition("active_launch_authority_requires_running_job")
+        if job.requested_action not in {RuntimeAction.START, RuntimeAction.RETRY}:
+            raise RuntimeInvalidTransition("active_launch_authority_requires_start_or_retry_job")
+        if (
+            instance.desired_state != RuntimeDesiredState.RUNNING
+            or instance.lifecycle_status != RuntimeLifecycleStatus.STARTING
+            or instance.failure_latched
+            or instance.retired_at is not None
+            or instance.optimistic_version != job.expected_instance_version + 1
+        ):
+            raise RuntimeInvalidTransition("active_launch_authority_instance_not_launching")
+        if attempt.status != RuntimeAttemptStatus.LAUNCHING:
+            raise RuntimeInvalidTransition("active_launch_authority_requires_launching_attempt")
+
     @staticmethod
     def _validate_resolved_material(
         session: Session,
         instance: RuntimeInstanceRecord,
         material: ResolvedRuntimeMaterial,
-    ) -> None:
+    ) -> PersistedLaunchAuthority:
+        return SqlRuntimeRepository._validate_resolved_material_with_template_policy(
+            session,
+            instance,
+            material,
+            allow_revoked_template=False,
+        )
+
+    @staticmethod
+    def _validate_active_resolved_material(
+        session: Session,
+        instance: RuntimeInstanceRecord,
+        material: ResolvedRuntimeMaterial,
+    ) -> PersistedLaunchAuthority:
+        return SqlRuntimeRepository._validate_resolved_material_with_template_policy(
+            session,
+            instance,
+            material,
+            allow_revoked_template=True,
+        )
+
+    @staticmethod
+    def _validate_resolved_material_with_template_policy(
+        session: Session,
+        instance: RuntimeInstanceRecord,
+        material: ResolvedRuntimeMaterial,
+        *,
+        allow_revoked_template: bool,
+    ) -> PersistedLaunchAuthority:
         if material.runtime_spec_revision_id != instance.runtime_spec_revision_id:
             raise RuntimeInvalidTransition("runtime_spec_mismatch")
         if material.state_allocation_id != instance.state_allocation_id:
@@ -2192,7 +2334,11 @@ class SqlRuntimeRepository:
             material.adapter_template_revision_id,
             resolved_secret_versions,
         )
-        SqlRuntimeRepository._validate_locked_template(material, template)
+        SqlRuntimeRepository._validate_locked_template(
+            material,
+            template,
+            allow_revoked=allow_revoked_template,
+        )
         SqlRuntimeRepository._validate_locked_secret_versions(
             instance,
             resolved_secret_versions,
@@ -2200,21 +2346,81 @@ class SqlRuntimeRepository:
             versions,
         )
         try:
-            final_authority = SqlRuntimeRepository._build_launch_authority(
-                SqlRuntimeRepository._launch_authority_rows(
-                    session,
-                    instance.instance_id,
-                    refresh_existing=True,
-                )
+            authority_rows = SqlRuntimeRepository._launch_authority_rows(
+                session,
+                instance.instance_id,
+                refresh_existing=True,
             )
+            build_authority = (
+                SqlRuntimeRepository._build_active_launch_authority
+                if allow_revoked_template
+                else SqlRuntimeRepository._build_launch_authority
+            )
+            final_authority = build_authority(authority_rows)
         except (TypeError, ValueError, ValidationError):
             raise RuntimeInvalidTransition("launch_authority_invalid") from None
+        SqlRuntimeRepository._require_current_authority_binding(
+            material,
+            final_authority,
+        )
+        return final_authority
+
+    @staticmethod
+    def _require_current_authority_binding(
+        material: ResolvedRuntimeMaterial,
+        authority: PersistedLaunchAuthority,
+    ) -> None:
+        if authority.runtime_spec.runtime_spec_revision_id != material.runtime_spec_revision_id:
+            raise RuntimeInvalidTransition("runtime_spec_mismatch")
+        if (
+            authority.adapter_template.adapter_template_revision_id
+            != material.adapter_template_revision_id
+        ):
+            raise RuntimeInvalidTransition("template_mismatch")
+        if authority.state_allocation.state_allocation_id != material.state_allocation_id:
+            raise RuntimeInvalidTransition("state_allocation_mismatch")
+        if authority.state_allocation.generation != material.state_allocation_generation:
+            raise RuntimeInvalidTransition("state_allocation_generation_mismatch")
+        if (
+            authority.adapter_template.root_commit,
+            authority.adapter_template.backend_commit,
+            authority.adapter_template.frontend_commit,
+            authority.adapter_template.strategies_commit,
+        ) != (
+            material.root_commit,
+            material.backend_commit,
+            material.frontend_commit,
+            material.strategies_commit,
+        ):
+            raise RuntimeInvalidTransition("component_commit_mismatch")
         final_secret_versions = {
             reference.secret_reference_id: reference.active_version_id
-            for reference in final_authority.secret_references
+            for reference in authority.secret_references
         }
-        if final_secret_versions != resolved_secret_versions:
+        if final_secret_versions != SqlRuntimeRepository._secret_version_mapping(material):
             raise RuntimeInvalidTransition("secret_version_selection_changed")
+
+    @staticmethod
+    def _active_attempt_material(
+        attempt: RuntimeAttemptRecord,
+    ) -> ResolvedRuntimeMaterial:
+        try:
+            return ResolvedRuntimeMaterial(
+                runtime_spec_revision_id=attempt.runtime_spec_revision_id,
+                adapter_template_revision_id=attempt.adapter_template_revision_id,
+                state_allocation_id=attempt.state_allocation_id,
+                state_allocation_generation=attempt.state_allocation_generation,
+                resolved_secret_versions=attempt.resolved_secret_versions,
+                image_id=attempt.image_id,
+                root_commit=attempt.root_commit,
+                backend_commit=attempt.backend_commit,
+                frontend_commit=attempt.frontend_commit,
+                strategies_commit=attempt.strategies_commit,
+                project_identity=attempt.project_identity,
+                container_identity=attempt.container_identity,
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise RuntimeDataError("invalid_active_attempt_material") from None
 
     @staticmethod
     def _runtime_spec_payload(canonical_payload: str) -> RuntimeSpecPayload:
@@ -2278,8 +2484,10 @@ class SqlRuntimeRepository:
     def _validate_locked_template(
         material: ResolvedRuntimeMaterial,
         template: AdapterTemplateRevisionRecord,
+        *,
+        allow_revoked: bool = False,
     ) -> None:
-        if template.status == "revoked":
+        if template.status == "revoked" and not allow_revoked:
             raise RuntimeInvalidTransition("template_revoked")
         if (
             material.root_commit,

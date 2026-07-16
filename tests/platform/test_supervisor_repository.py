@@ -330,6 +330,7 @@ def _resolved_material(
         runtime_spec_revision_id=RUNTIME_SPEC_REVISION_ID,
         adapter_template_revision_id=TEMPLATE_REVISION_ID,
         state_allocation_id="state-allocation-1",
+        state_allocation_generation=1,
         resolved_secret_versions=(
             {"exchange": "secret-version-1"}
             if secret_versions is None
@@ -355,6 +356,8 @@ def _seed_active_attempt(engine: Engine, instance_id: str, image_suffix: str) ->
                 attempt_number=1,
                 runtime_spec_revision_id=material.runtime_spec_revision_id,
                 adapter_template_revision_id=material.adapter_template_revision_id,
+                state_allocation_id=material.state_allocation_id,
+                state_allocation_generation=material.state_allocation_generation,
                 resolved_secret_versions={"exchange": "secret-version-1"},
                 image_id=material.image_id,
                 root_commit=material.root_commit,
@@ -1328,6 +1331,7 @@ def test_resolved_material_is_closed_typed_and_contains_no_path_or_secret_value_
         "runtime_spec_revision_id",
         "adapter_template_revision_id",
         "state_allocation_id",
+        "state_allocation_generation",
         "resolved_secret_versions",
         "image_id",
         "root_commit",

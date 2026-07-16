@@ -205,6 +205,8 @@ def _seed_attempt(
         "attempt_number": 1,
         "runtime_spec_revision_id": RUNTIME_SPEC_REVISION_ID,
         "adapter_template_revision_id": "adapter-template-1",
+        "state_allocation_id": "state-allocation-1",
+        "state_allocation_generation": 1,
         "resolved_secret_versions": {"exchange": "version-1"},
         "image_id": "sha256:image-1",
         "root_commit": "1" * 40,

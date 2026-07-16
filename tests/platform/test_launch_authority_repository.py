@@ -5,7 +5,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import Engine, create_engine, event, update
+from sqlalchemy import Engine, create_engine, event, select, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
 import freqtrade.platform as platform
@@ -18,9 +19,14 @@ from freqtrade.platform.runtime_domain import (
     RuntimeLifecycleCommand,
     RuntimeOwnerRef,
 )
-from freqtrade.platform.runtime_models import RuntimeInstanceRecord, RuntimeLifecycleJobRecord
+from freqtrade.platform.runtime_models import (
+    RuntimeAttemptRecord,
+    RuntimeInstanceRecord,
+    RuntimeLifecycleJobRecord,
+)
 from freqtrade.platform.runtime_repository import (
     PersistedLaunchAuthority,
+    ResolvedRuntimeMaterial,
     RuntimeDataError,
     RuntimeInvalidTransition,
     RuntimeNotFound,
@@ -272,6 +278,19 @@ def _update(engine: Engine, record_type: type[PlatformBase], **values: object) -
             connection.exec_driver_sql("PRAGMA ignore_check_constraints=OFF")
 
 
+def _database_snapshot(engine: Engine) -> tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]:
+    snapshots: list[tuple[str, tuple[tuple[object, ...], ...]]] = []
+    with engine.connect() as connection:
+        for table in sorted(PlatformBase.metadata.tables.values(), key=lambda item: item.name):
+            primary_key = tuple(table.primary_key.columns)
+            statement = select(table)
+            if primary_key:
+                statement = statement.order_by(*primary_key)
+            rows = connection.execute(statement)
+            snapshots.append((table.name, tuple(tuple(row) for row in rows)))
+    return tuple(snapshots)
+
+
 def _claim_start(repository: SqlRuntimeRepository) -> tuple[RuntimeJobView, str]:
     job = repository.create_job(
         RuntimeLifecycleCommand(
@@ -291,6 +310,46 @@ def _claim_start(repository: SqlRuntimeRepository) -> tuple[RuntimeJobView, str]
         claimed.lease_generation,
     )
     return claimed, attempt_id
+
+
+def _resolved_material(authority: PersistedLaunchAuthority) -> ResolvedRuntimeMaterial:
+    return ResolvedRuntimeMaterial(
+        runtime_spec_revision_id=authority.runtime_spec.runtime_spec_revision_id,
+        adapter_template_revision_id=(authority.adapter_template.adapter_template_revision_id),
+        state_allocation_id=authority.state_allocation.state_allocation_id,
+        state_allocation_generation=authority.state_allocation.generation,
+        resolved_secret_versions={
+            reference.secret_reference_id: reference.active_version_id
+            for reference in authority.secret_references
+        },
+        image_id=f"sha256:{'a' * 64}",
+        root_commit=authority.adapter_template.root_commit,
+        backend_commit=authority.adapter_template.backend_commit,
+        frontend_commit=authority.adapter_template.frontend_commit,
+        strategies_commit=authority.adapter_template.strategies_commit,
+        project_identity=f"project-{authority.instance.instance_id}",
+        container_identity=f"container-{authority.instance.instance_id}",
+    )
+
+
+def _begin_start(
+    repository: SqlRuntimeRepository,
+) -> tuple[RuntimeJobView, str, PersistedLaunchAuthority]:
+    job, attempt_id = _claim_start(repository)
+    authority = repository.resolve_launch_authority_material(
+        job.job_id,
+        attempt_id,
+        "supervisor-1",
+        job.lease_generation,
+    )
+    repository.begin_attempt(
+        job.job_id,
+        attempt_id,
+        _resolved_material(authority),
+        "supervisor-1",
+        job.lease_generation,
+    )
+    return job, attempt_id, authority
 
 
 def test_launch_authority_is_immutable_complete_and_loaded_by_one_authority_join(
@@ -521,6 +580,38 @@ def test_launch_authority_rejects_more_than_one_active_version(
         )
 
 
+def test_begin_attempt_rejects_template_revoked_after_prepared_authority(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id = _claim_start(repository)
+    authority = repository.resolve_launch_authority_material(
+        job.job_id,
+        attempt_id,
+        "supervisor-1",
+        job.lease_generation,
+    )
+    _update(
+        engine,
+        AdapterTemplateRevisionRecord,
+        status="revoked",
+        revoked_at=NOW,
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^template_revoked$"):
+        repository.begin_attempt(
+            job.job_id,
+            attempt_id,
+            _resolved_material(authority),
+            "supervisor-1",
+            job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
 def test_prepared_attempt_identity_is_idempotent_and_changes_with_generation(
     engine: Engine,
     repository: SqlRuntimeRepository,
@@ -686,3 +777,555 @@ def test_launch_authority_rejects_terminal_and_stop_jobs(
             "supervisor-1",
             job.lease_generation,
         )
+
+
+def test_active_launch_authority_revalidates_exact_post_begin_context(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, before_begin = _begin_start(repository)
+
+    revalidated = repository.revalidate_active_launch_authority_material(
+        job.job_id,
+        attempt_id,
+        "supervisor-1",
+        job.lease_generation,
+    )
+
+    assert isinstance(revalidated, PersistedLaunchAuthority)
+    assert revalidated.instance.instance_id == before_begin.instance.instance_id
+    assert revalidated.instance.lifecycle_status == "starting"
+    assert revalidated.runtime_spec == before_begin.runtime_spec
+    assert revalidated.adapter_template == before_begin.adapter_template
+    assert revalidated.state_allocation == before_begin.state_allocation
+    assert revalidated.secret_references == before_begin.secret_references
+    assert isinstance(repository, RuntimeRepository)
+
+
+@pytest.mark.parametrize(
+    ("attempt_values", "error"),
+    [
+        ({"runtime_spec_revision_id": "runtime-spec-other"}, "runtime_spec_mismatch"),
+        ({"adapter_template_revision_id": "template-other"}, "template_mismatch"),
+        (
+            {
+                "resolved_secret_versions": {
+                    "exchange": "secret-version-missing",
+                    "jwt": "secret-version-2",
+                }
+            },
+            "secret_version_not_found",
+        ),
+        ({"root_commit": "9" * 40}, "component_commit_mismatch"),
+        ({"backend_commit": "9" * 40}, "component_commit_mismatch"),
+        ({"frontend_commit": "9" * 40}, "component_commit_mismatch"),
+        ({"strategies_commit": "9" * 40}, "component_commit_mismatch"),
+        ({"image_id": "unreviewed-image"}, "invalid_active_attempt_material"),
+        ({"project_identity": ""}, "invalid_active_attempt_material"),
+        ({"container_identity": ""}, "invalid_active_attempt_material"),
+    ],
+    ids=[
+        "runtime-spec",
+        "adapter-template",
+        "secret-version",
+        "root-commit",
+        "backend-commit",
+        "frontend-commit",
+        "strategies-commit",
+        "image",
+        "project",
+        "container",
+    ],
+)
+def test_active_launch_authority_rejects_persisted_attempt_material_drift(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    attempt_values: dict[str, object],
+    error: str,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, RuntimeAttemptRecord, **attempt_values)
+    before = _database_snapshot(engine)
+
+    with pytest.raises((RuntimeDataError, RuntimeInvalidTransition), match=rf"^{error}$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_rejects_current_authority_drift(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, AdapterTemplateRevisionRecord, backend_commit="9" * 40)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^component_commit_mismatch$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_accepts_template_revoked_after_attempt_begin(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, before_revoke = _begin_start(repository)
+    _update(
+        engine,
+        AdapterTemplateRevisionRecord,
+        status="revoked",
+        revoked_at=NOW,
+    )
+    before = _database_snapshot(engine)
+
+    revalidated = repository.revalidate_active_launch_authority_material(
+        job.job_id,
+        attempt_id,
+        "supervisor-1",
+        job.lease_generation,
+    )
+
+    assert revalidated.adapter_template.status == "revoked"
+    assert revalidated.adapter_template.canonical_payload == (
+        before_revoke.adapter_template.canonical_payload
+    )
+    assert revalidated.adapter_template.payload_digest == (
+        before_revoke.adapter_template.payload_digest
+    )
+    assert revalidated.adapter_template.backend_commit == (
+        before_revoke.adapter_template.backend_commit
+    )
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize(
+    ("template_values", "error"),
+    [
+        ({"canonical_payload": "{}"}, "launch_authority_invalid"),
+        ({"payload_digest": "9" * 64}, "launch_authority_invalid"),
+        ({"backend_commit": "9" * 40}, "component_commit_mismatch"),
+    ],
+    ids=["payload", "digest", "commits"],
+)
+def test_active_launch_authority_rejects_revoked_template_material_drift(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    template_values: dict[str, object],
+    error: str,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(
+        engine,
+        AdapterTemplateRevisionRecord,
+        status="revoked",
+        revoked_at=NOW,
+        **template_values,
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises((RuntimeDataError, RuntimeInvalidTransition), match=rf"^{error}$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize(
+    ("record_type", "values", "error"),
+    [
+        (
+            RuntimeLifecycleJobRecord,
+            {"status": "claimed"},
+            "active_launch_authority_requires_running_job",
+        ),
+        (
+            RuntimeInstanceRecord,
+            {"lifecycle_status": "failed"},
+            "active_launch_authority_instance_not_launching",
+        ),
+        (
+            RuntimeAttemptRecord,
+            {"status": "failed"},
+            "active_launch_authority_requires_launching_attempt",
+        ),
+    ],
+    ids=["job", "instance", "attempt"],
+)
+def test_active_launch_authority_revoked_template_still_requires_explicit_fences(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    record_type: type[PlatformBase],
+    values: dict[str, object],
+    error: str,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(
+        engine,
+        AdapterTemplateRevisionRecord,
+        status="revoked",
+        revoked_at=NOW,
+    )
+    _update(engine, record_type, **values)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=rf"^{error}$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_rejects_state_generation_drift_without_mutation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, StateAllocationRecord, generation=2)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^state_allocation_generation_mismatch$",
+    ):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize(
+    "instance_values",
+    [
+        {"desired_state": "stopped"},
+        {"lifecycle_status": "failed"},
+        {"failure_latched": True},
+        {"retired_at": NOW},
+        {"optimistic_version": 9},
+    ],
+    ids=["desired", "lifecycle", "failure-latch", "retired", "version"],
+)
+def test_active_launch_authority_rejects_instance_context_drift_without_mutation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    instance_values: dict[str, object],
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, RuntimeInstanceRecord, **instance_values)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^active_launch_authority_instance_not_launching$",
+    ):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize("attempt_status", ["pending", "validating", "healthy", "stopping"])
+def test_active_launch_authority_requires_exact_launching_attempt_without_mutation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    attempt_status: str,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, RuntimeAttemptRecord, status=attempt_status)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^active_launch_authority_requires_launching_attempt$",
+    ):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_accepts_old_attempt_after_stale_lease_reclaim(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    clock: MutableClock,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, before_reclaim = _begin_start(repository)
+    clock.now += timedelta(seconds=31)
+    stale = repository.claim_next_job("supervisor-reaper", lease_seconds=30)
+    assert stale is not None
+    assert stale.status == "needs_reconciliation"
+    reclaimed = repository.reclaim_reconciliation_job(
+        job.job_id,
+        "supervisor-2",
+        lease_seconds=45,
+    )
+
+    revalidated = repository.revalidate_active_launch_authority_material(
+        reclaimed.job_id,
+        attempt_id,
+        "supervisor-2",
+        reclaimed.lease_generation,
+    )
+
+    assert revalidated.instance.lifecycle_status == "starting"
+    assert revalidated.runtime_spec == before_reclaim.runtime_spec
+    assert revalidated.adapter_template == before_reclaim.adapter_template
+
+
+@pytest.mark.parametrize(
+    ("lease_owner", "lease_generation", "error"),
+    [
+        ("wrong-supervisor", 1, "lease_owner_mismatch"),
+        ("supervisor-1", 2, "lease_generation_mismatch"),
+    ],
+    ids=["wrong-owner", "wrong-generation"],
+)
+def test_active_launch_authority_requires_exact_lease_identity(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    lease_owner: str,
+    lease_generation: int,
+    error: str,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=rf"^{error}$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            lease_owner,
+            lease_generation,
+        )
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_rejects_expired_lease(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    clock: MutableClock,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    clock.now += timedelta(seconds=31)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^lease_expired$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize(
+    ("job_values", "error"),
+    [
+        ({"status": "claimed"}, "active_launch_authority_requires_running_job"),
+        (
+            {"requested_action": "stop"},
+            "active_launch_authority_requires_start_or_retry_job",
+        ),
+    ],
+    ids=["job-not-running", "job-not-start-or-retry"],
+)
+def test_active_launch_authority_rejects_wrong_job_state(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    job_values: dict[str, object],
+    error: str,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, RuntimeLifecycleJobRecord, **job_values)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=rf"^{error}$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_rejects_inactive_attempt(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    _update(engine, RuntimeAttemptRecord, status="failed")
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^active_launch_authority_requires_launching_attempt$",
+    ):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before
+
+
+def test_active_launch_authority_rejects_missing_or_foreign_attempt(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    before_missing = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeNotFound, match=r"^runtime_attempt_not_found$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            "attempt-missing",
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before_missing
+
+    _update(engine, RuntimeAttemptRecord, instance_id="foreign-instance")
+    before_foreign = _database_snapshot(engine)
+    with pytest.raises(RuntimeInvalidTransition, match=r"^job_attempt_instance_mismatch$"):
+        repository.revalidate_active_launch_authority_material(
+            job.job_id,
+            attempt_id,
+            "supervisor-1",
+            job.lease_generation,
+        )
+    assert _database_snapshot(engine) == before_foreign
+
+
+def test_active_launch_authority_locks_runtime_rows_then_reads_authority_without_update_locks(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_launch_authority(engine)
+    job, attempt_id, _ = _begin_start(repository)
+    statements: list[str] = []
+    original_scalar = Session.scalar
+    original_scalars = Session.scalars
+    original_execute = Session.execute
+
+    def compile_statement(statement: object) -> None:
+        if hasattr(statement, "compile"):
+            statements.append(str(statement.compile(dialect=postgresql.dialect())).upper())
+
+    def record_scalar(
+        session: Session,
+        statement: object,
+        *args: object,
+        **kwargs: object,
+    ):
+        compile_statement(statement)
+        return original_scalar(session, statement, *args, **kwargs)
+
+    def record_scalars(
+        session: Session,
+        statement: object,
+        *args: object,
+        **kwargs: object,
+    ):
+        compile_statement(statement)
+        return original_scalars(session, statement, *args, **kwargs)
+
+    def record_execute(
+        session: Session,
+        statement: object,
+        *args: object,
+        **kwargs: object,
+    ):
+        compile_statement(statement)
+        return original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "scalar", record_scalar)
+    monkeypatch.setattr(Session, "scalars", record_scalars)
+    monkeypatch.setattr(Session, "execute", record_execute)
+
+    repository.revalidate_active_launch_authority_material(
+        job.job_id,
+        attempt_id,
+        "supervisor-1",
+        job.lease_generation,
+    )
+
+    runtime_tables = (
+        "RUNTIME_LIFECYCLE_JOBS",
+        "RUNTIME_INSTANCES",
+        "RUNTIME_ATTEMPTS",
+    )
+    locked = [
+        next(
+            statement
+            for statement in statements
+            if f"FROM {table_name}" in statement and "FOR UPDATE" in statement
+        )
+        for table_name in runtime_tables
+    ]
+    assert [statements.index(statement) for statement in locked] == sorted(
+        statements.index(statement) for statement in locked
+    )
+    authority_reads = [
+        statement
+        for statement in statements
+        if any(
+            table_name in statement
+            for table_name in (
+                "ADAPTER_TEMPLATE_REVISIONS",
+                "STATE_ALLOCATIONS",
+                "SECRET_REFERENCES",
+                "SECRET_VERSION_METADATA",
+                "RUNTIME_SPEC_REVISIONS",
+            )
+        )
+    ]
+    assert authority_reads
+    assert all("FOR UPDATE" not in statement for statement in authority_reads)
