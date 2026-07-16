@@ -32,7 +32,11 @@ from freqtrade.platform.runtime_models import (
     RuntimeInstanceRecord,
     RuntimeLifecycleJobRecord,
 )
-from freqtrade.platform.runtime_repository import RuntimeInvalidTransition, SqlRuntimeRepository
+from freqtrade.platform.runtime_repository import (
+    RuntimeDataError,
+    RuntimeInvalidTransition,
+    SqlRuntimeRepository,
+)
 from freqtrade.platform.runtime_spec import (
     RuntimeMarketScope,
     RuntimeSpecPayload,
@@ -354,13 +358,60 @@ def _begin_attempt(
     repository: SqlRuntimeRepository,
     job_id: str,
     material: runtime_service.ResolvedRuntimeMaterial | None = None,
+    *,
+    lease_owner: str = "supervisor-1",
+    lease_generation: int = 1,
 ) -> RuntimeAttemptView:
-    attempt_id = repository.prepare_attempt_id(job_id)
+    attempt_id = repository.prepare_attempt_id(job_id, lease_owner, lease_generation)
     return repository.begin_attempt(
         job_id,
         attempt_id,
         _resolved_material() if material is None else material,
+        lease_owner,
+        lease_generation,
     )
+
+
+def _lease_args(job: RuntimeJobView) -> dict[str, object]:
+    assert job.lease_owner is not None
+    return {
+        "lease_owner": job.lease_owner,
+        "lease_generation": job.lease_generation,
+    }
+
+
+def _complete_health_probe(
+    repository: SqlRuntimeRepository,
+    job: RuntimeJobView,
+    attempt_id: str,
+    result_code: str = "health_probe_healthy",
+) -> None:
+    reservation = repository.reserve_health_probe(
+        job.job_id,
+        attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(job),
+    )
+    repository.record_health_observation(
+        job.job_id,
+        attempt_id,
+        result_code,
+        reservation.attempts,
+        None if result_code == "health_probe_healthy" else result_code,
+        **_lease_args(job),
+    )
+
+
+def _record_healthy(
+    repository: SqlRuntimeRepository,
+    job: RuntimeJobView,
+    attempt_id: str,
+) -> RuntimeAttemptView:
+    _complete_health_probe(repository, job, attempt_id)
+    return repository.record_healthy(job.job_id, attempt_id, **_lease_args(job))
 
 
 def _database_snapshot(engine: Engine) -> tuple[tuple[tuple[object, ...], ...], ...]:
@@ -454,7 +505,11 @@ def test_supervisor_repository_contract_exposes_all_transition_methods(
         "prepare_attempt_id",
         "begin_attempt",
         "get_latest_attempt_material",
+        "assert_current_lease",
+        "reserve_health_probe",
+        "record_health_observation",
         "record_reconciliation_blocked",
+        "reclaim_reconciliation_job",
         "record_healthy",
         "record_failed",
         "record_stopped",
@@ -471,10 +526,42 @@ def test_prepare_attempt_id_returns_repository_identity_without_database_mutatio
 ) -> None:
     before = _database_snapshot(engine)
 
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
 
     assert attempt_id.startswith("attempt-")
     assert _database_snapshot(engine) == before
+
+
+def test_claim_grants_lease_from_post_lock_time(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+) -> None:
+    repository.create_job(_command("start", "post-lock-claim"), "operator_cli")
+    lock_query_seen = False
+
+    def consume_time_while_waiting_for_lock(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        nonlocal lock_query_seen
+        if not lock_query_seen and "FROM runtime_lifecycle_jobs" in statement:
+            lock_query_seen = True
+            clock.now += timedelta(seconds=5)
+
+    event.listen(engine, "before_cursor_execute", consume_time_while_waiting_for_lock)
+    try:
+        claimed = repository.claim_next_job("supervisor-1", lease_seconds=30)
+    finally:
+        event.remove(engine, "before_cursor_execute", consume_time_while_waiting_for_lock)
+
+    assert claimed is not None
+    assert lock_query_seen is True
+    assert claimed.lease_expires_at == NOW + timedelta(seconds=35)
 
 
 def test_prepare_attempt_id_requires_current_lease_without_database_mutation(
@@ -487,7 +574,7 @@ def test_prepare_attempt_id_requires_current_lease_without_database_mutation(
     clock.now += timedelta(seconds=31)
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^lease_expired$"):
-        repository.prepare_attempt_id(running_job.job_id)
+        repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
 
     assert _database_snapshot(engine) == before
 
@@ -498,7 +585,7 @@ def test_prepare_attempt_id_requires_start_or_retry_job_without_database_mutatio
     running_job,
 ) -> None:
     attempt = _begin_attempt(repository, running_job.job_id)
-    repository.record_healthy(running_job.job_id, attempt.attempt_id)
+    _record_healthy(repository, running_job, attempt.attempt_id)
     repository.create_job(_command("stop", "stop-prepare", version=1), "operator_cli")
     stop_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
     assert stop_job is not None
@@ -508,7 +595,7 @@ def test_prepare_attempt_id_requires_start_or_retry_job_without_database_mutatio
         RuntimeInvalidTransition,
         match=r"^attempt_requires_start_or_retry_job$",
     ):
-        repository.prepare_attempt_id(stop_job.job_id)
+        repository.prepare_attempt_id(stop_job.job_id, **_lease_args(stop_job))
 
     assert _database_snapshot(engine) == before
 
@@ -522,7 +609,7 @@ def test_prepare_attempt_id_rejects_active_attempt_without_database_mutation(
     before = _database_snapshot(engine)
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^active_attempt_exists$"):
-        repository.prepare_attempt_id(running_job.job_id)
+        repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
 
     assert _database_snapshot(engine) == before
 
@@ -531,9 +618,14 @@ def test_begin_attempt_persists_exact_prepared_identity(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
 
-    attempt = repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
+    attempt = repository.begin_attempt(
+        running_job.job_id,
+        attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
 
     assert attempt.attempt_id == attempt_id
 
@@ -543,13 +635,27 @@ def test_begin_attempt_rechecks_active_attempt_after_candidate_preparation(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    first_attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    second_attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    repository.begin_attempt(running_job.job_id, first_attempt_id, _resolved_material())
+    first_attempt_id = repository.prepare_attempt_id(
+        running_job.job_id, **_lease_args(running_job)
+    )
+    second_attempt_id = repository.prepare_attempt_id(
+        running_job.job_id, **_lease_args(running_job)
+    )
+    repository.begin_attempt(
+        running_job.job_id,
+        first_attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
     before = _database_snapshot(engine)
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^active_attempt_exists$"):
-        repository.begin_attempt(running_job.job_id, second_attempt_id, _resolved_material())
+        repository.begin_attempt(
+            running_job.job_id,
+            second_attempt_id,
+            _resolved_material(),
+            **_lease_args(running_job),
+        )
 
     assert _database_snapshot(engine) == before
 
@@ -559,14 +665,21 @@ def test_latest_attempt_material_is_closed_deeply_immutable_and_secret_safe(
     running_job,
 ) -> None:
     assert repository.get_latest_attempt_material("instance-1") is None
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
+    repository.begin_attempt(
+        running_job.job_id,
+        attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
 
     recovery = repository.get_latest_attempt_material("instance-1")
 
     assert recovery is not None
     assert recovery.attempt_id == attempt_id
     assert recovery.status == "launching"
+    assert recovery.started_at == NOW
+    assert recovery.health_result is None
     assert recovery.runtime_spec_payload_digest == RUNTIME_SPEC_PAYLOAD_DIGEST
     assert recovery.resolved_material == _resolved_material()
     dumped = recovery.model_dump(mode="json")
@@ -574,6 +687,8 @@ def test_latest_attempt_material_is_closed_deeply_immutable_and_secret_safe(
     assert set(dumped) == {
         "attempt_id",
         "status",
+        "started_at",
+        "health_result",
         "runtime_spec_payload_digest",
         "resolved_material",
     }
@@ -586,6 +701,347 @@ def test_latest_attempt_material_is_closed_deeply_immutable_and_secret_safe(
         recovery.resolved_material.resolved_secret_versions[0].version_id = "tampered"
 
 
+def test_health_observation_is_durable_monotonic_and_does_not_finish_or_retry(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    deadline = NOW + timedelta(seconds=20)
+    first_reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        deadline,
+        NOW,
+        **_lease_args(running_job),
+    )
+    reserved_recovery = repository.get_latest_attempt_material("instance-1")
+    assert reserved_recovery is not None
+    assert reserved_recovery.health_result == first_reservation
+    assert first_reservation.attempts == 1
+    assert first_reservation.result_code == "health_probe_reserved"
+
+    first = repository.record_health_observation(
+        running_job.job_id,
+        attempt.attempt_id,
+        "health_probe_unhealthy",
+        attempts=1,
+        last_failure_code="connection_refused",
+        **_lease_args(running_job),
+    )
+    second_reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        deadline,
+        NOW + timedelta(seconds=1),
+        **_lease_args(running_job),
+    )
+    second = repository.record_health_observation(
+        running_job.job_id,
+        attempt.attempt_id,
+        "health_probe_unhealthy",
+        attempts=2,
+        last_failure_code="connection_refused",
+        **_lease_args(running_job),
+    )
+
+    instance, job, record = _persisted_records(engine, running_job.job_id, attempt.attempt_id)
+    recovery = repository.get_latest_attempt_material("instance-1")
+    assert first.status == "launching"
+    assert second.status == "launching"
+    assert instance.lifecycle_status == "starting"
+    assert instance.failure_latched is False
+    assert job.status == "running"
+    assert job.lease_owner == "supervisor-1"
+    assert job.lease_generation == 1
+    assert job.lease_expires_at == (NOW + timedelta(seconds=30)).replace(tzinfo=None)
+    assert record.health_result == {
+        "profile_id": "api-ping-v1",
+        "profile_digest": "8" * 64,
+        "deadline_at": deadline.isoformat().replace("+00:00", "Z"),
+        "next_probe_not_before": (NOW + timedelta(seconds=1)).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "result_code": "health_probe_unhealthy",
+        "attempts": 2,
+        "last_failure_code": "connection_refused",
+    }
+    assert recovery is not None
+    assert recovery.started_at == NOW
+    assert recovery.health_result is not None
+    assert recovery.health_result.result_code == "health_probe_unhealthy"
+    assert recovery.health_result.attempts == 2
+    assert second_reservation.attempts == 2
+    assert recovery.health_result.last_failure_code == "connection_refused"
+    assert all(item.status != "pending" for item in repository.list_jobs("instance-1"))
+    with pytest.raises(ValidationError):
+        recovery.health_result.attempts = 0
+
+
+def test_health_probe_schedule_cannot_move_backwards_without_mutation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    deadline = NOW + timedelta(seconds=20)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        deadline,
+        NOW + timedelta(seconds=2),
+        **_lease_args(running_job),
+    )
+    repository.record_health_observation(
+        running_job.job_id,
+        attempt.attempt_id,
+        "health_probe_unhealthy",
+        attempts=reservation.attempts,
+        last_failure_code="connection_refused",
+        **_lease_args(running_job),
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^health_probe_schedule_regression$",
+    ):
+        repository.reserve_health_probe(
+            running_job.job_id,
+            attempt.attempt_id,
+            "api-ping-v1",
+            "8" * 64,
+            deadline,
+            NOW + timedelta(seconds=1),
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_health_probe_schedule_accepts_exact_deadline(
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    deadline = NOW + timedelta(seconds=20)
+
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        deadline,
+        deadline,
+        **_lease_args(running_job),
+    )
+
+    assert reservation.next_probe_not_before == deadline
+
+
+def test_health_probe_schedule_rejects_after_deadline_without_mutation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    deadline = NOW + timedelta(seconds=20)
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^health_probe_after_deadline$"):
+        repository.reserve_health_probe(
+            running_job.job_id,
+            attempt.attempt_id,
+            "api-ping-v1",
+            "8" * 64,
+            deadline,
+            deadline + timedelta(microseconds=1),
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize("attempts", [0, -1, True, 1.0, "1"])
+def test_health_observation_rejects_invalid_attempt_count_without_mutation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+    attempts: object,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(running_job),
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^invalid_health_observation$"):
+        repository.record_health_observation(
+            running_job.job_id,
+            attempt.attempt_id,
+            "health_probe_healthy",
+            attempts=attempts,
+            last_failure_code=None,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize(
+    ("result_code", "last_failure_code"),
+    [
+        ("health_probe_reserved", None),
+        ("healthy", None),
+        ("health_probe_healthy", "unexpected_failure"),
+        ("health_probe_unhealthy", None),
+        ("health_probe_unknown", None),
+        ("health_probe_interrupted", None),
+    ],
+)
+def test_health_observation_rejects_open_or_inconsistent_results_atomically(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+    result_code: str,
+    last_failure_code: str | None,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(running_job),
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^invalid_health_observation$"):
+        repository.record_health_observation(
+            running_job.job_id,
+            attempt.attempt_id,
+            result_code,
+            reservation.attempts,
+            last_failure_code,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_health_probe_reservation_is_crash_durable_and_ordinal_cannot_repeat(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(running_job),
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^health_probe_already_reserved$"):
+        repository.reserve_health_probe(
+            running_job.job_id,
+            attempt.attempt_id,
+            "api-ping-v1",
+            "8" * 64,
+            NOW + timedelta(seconds=20),
+            NOW,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_health_observation_requires_exact_active_attempt_binding(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    _begin_attempt(repository, running_job.job_id, _resolved_material("a"))
+    _seed_instance(engine, "instance-2")
+    repository.create_job(
+        _command("start", "start-2", instance_id="instance-2"),
+        "operator_cli",
+    )
+    other_job = repository.claim_next_job("supervisor-2", lease_seconds=30)
+    assert other_job is not None
+    other_attempt = _begin_attempt(
+        repository,
+        other_job.job_id,
+        _resolved_material("b"),
+        lease_owner="supervisor-2",
+        lease_generation=other_job.lease_generation,
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^job_attempt_instance_mismatch$"):
+        repository.reserve_health_probe(
+            running_job.job_id,
+            other_attempt.attempt_id,
+            "api-ping-v1",
+            "8" * 64,
+            NOW + timedelta(seconds=20),
+            NOW,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_latest_attempt_rejects_malformed_persisted_health_evidence(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    with Session(engine) as session, session.begin():
+        record = session.get(RuntimeAttemptRecord, attempt.attempt_id)
+        assert record is not None
+        record.health_result = {"result_code": "starting", "attempts": 0}
+
+    with pytest.raises(RuntimeDataError, match=r"^invalid_health_result$"):
+        repository.get_latest_attempt_material("instance-1")
+
+
+def test_latest_attempt_preserves_legacy_nullable_started_at(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    with Session(engine) as session, session.begin():
+        record = session.get(RuntimeAttemptRecord, attempt.attempt_id)
+        assert record is not None
+        record.started_at = None
+
+    recovery = repository.get_latest_attempt_material("instance-1")
+
+    assert recovery is not None
+    assert recovery.started_at is None
+
+
 def test_record_reconciliation_blocked_without_attempt_is_atomic(
     engine: Engine,
     repository: SqlRuntimeRepository,
@@ -595,6 +1051,7 @@ def test_record_reconciliation_blocked_without_attempt_is_atomic(
         running_job.job_id,
         None,
         "identity_ambiguous",
+        **_lease_args(running_job),
     )
 
     instance = repository.get_instance("instance-1")
@@ -615,13 +1072,39 @@ def test_record_reconciliation_blocked_without_attempt_is_atomic(
     assert audit.result_code == "identity_ambiguous"
 
 
+def test_record_reconciliation_blocked_cannot_forge_stale_lease(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^reserved_reconciliation_failure_code$",
+    ):
+        repository.record_reconciliation_blocked(
+            running_job.job_id,
+            None,
+            "stale_lease",
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
 def test_record_reconciliation_blocked_preserves_exact_active_attempt(
     engine: Engine,
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
+    repository.begin_attempt(
+        running_job.job_id,
+        attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
     with Session(engine) as session:
         before = tuple(session.execute(select(*RuntimeAttemptRecord.__table__.columns)).one())
 
@@ -629,6 +1112,7 @@ def test_record_reconciliation_blocked_preserves_exact_active_attempt(
         running_job.job_id,
         attempt_id,
         "identity_mismatch",
+        **_lease_args(running_job),
     )
 
     with Session(engine) as session:
@@ -642,8 +1126,13 @@ def test_record_reconciliation_blocked_rolls_back_if_audit_write_fails(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
+    repository.begin_attempt(
+        running_job.job_id,
+        attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
     before = _database_snapshot(engine)
 
     def fail_audit(*_args: object, **_kwargs: object) -> None:
@@ -655,6 +1144,7 @@ def test_record_reconciliation_blocked_rolls_back_if_audit_write_fails(
             running_job.job_id,
             attempt_id,
             "identity_mismatch",
+            **_lease_args(running_job),
         )
 
     assert _database_snapshot(engine) == before
@@ -667,8 +1157,15 @@ def test_record_reconciliation_blocked_requires_exact_optional_attempt_binding(
     running_job,
     attempt_id: str | None,
 ) -> None:
-    exact_attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    repository.begin_attempt(running_job.job_id, exact_attempt_id, _resolved_material())
+    exact_attempt_id = repository.prepare_attempt_id(
+        running_job.job_id, **_lease_args(running_job)
+    )
+    repository.begin_attempt(
+        running_job.job_id,
+        exact_attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
     before = _database_snapshot(engine)
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^active_attempt_binding_mismatch$"):
@@ -676,6 +1173,7 @@ def test_record_reconciliation_blocked_requires_exact_optional_attempt_binding(
             running_job.job_id,
             attempt_id,
             "identity_mismatch",
+            **_lease_args(running_job),
         )
 
     assert _database_snapshot(engine) == before
@@ -718,12 +1216,17 @@ def test_begin_attempt_creates_monotonic_append_only_attempt(
 ) -> None:
     first_material = _resolved_material("a")
     first = _begin_attempt(repository, running_job.job_id, first_material)
-    repository.record_healthy(running_job.job_id, first.attempt_id)
+    _record_healthy(repository, running_job, first.attempt_id)
 
     repository.create_job(_command("stop", "stop-1", version=1), "operator_cli")
     stop_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
     assert stop_job is not None
-    repository.record_stopped(stop_job.job_id, first.attempt_id, exit_code=0)
+    repository.record_stopped(
+        stop_job.job_id,
+        first.attempt_id,
+        exit_code=0,
+        **_lease_args(stop_job),
+    )
 
     repository.create_job(_command("start", "start-2", version=2), "operator_cli")
     next_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
@@ -809,11 +1312,16 @@ def test_begin_attempt_requires_current_leased_start_or_retry_job(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
     clock.now += timedelta(seconds=31)
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^lease_expired$"):
-        repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
+        repository.begin_attempt(
+            running_job.job_id,
+            attempt_id,
+            _resolved_material(),
+            **_lease_args(running_job),
+        )
 
     assert repository.list_attempts("instance-1") == ()
 
@@ -825,17 +1333,69 @@ def test_record_healthy_binds_job_and_attempt_and_completes_atomically(
 ) -> None:
     attempt = _begin_attempt(repository, running_job.job_id)
 
-    healthy = repository.record_healthy(running_job.job_id, attempt.attempt_id)
+    healthy = _record_healthy(repository, running_job, attempt.attempt_id)
     instance, job, record = _persisted_records(engine, running_job.job_id, attempt.attempt_id)
 
     assert healthy.status == "healthy"
-    assert healthy.health_result == "healthy"
+    assert healthy.health_result == "health_probe_healthy"
     assert instance.lifecycle_status == "healthy"
     assert instance.failure_latched is False
     assert job.status == "succeeded"
     assert job.lease_owner is None
     assert job.lease_expires_at is None
-    assert record.health_result == {"result_code": "healthy"}
+    assert record.health_result is not None
+    assert record.health_result["result_code"] == "health_probe_healthy"
+
+
+@pytest.mark.parametrize(
+    "evidence_result",
+    [
+        None,
+        "health_probe_reserved",
+        "health_probe_unhealthy",
+        "health_probe_unknown",
+        "health_probe_interrupted",
+    ],
+)
+def test_record_healthy_requires_exact_completed_healthy_probe_evidence(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+    evidence_result: str | None,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    if evidence_result is not None:
+        reservation = repository.reserve_health_probe(
+            running_job.job_id,
+            attempt.attempt_id,
+            "api-ping-v1",
+            "8" * 64,
+            NOW + timedelta(seconds=20),
+            NOW,
+            **_lease_args(running_job),
+        )
+        if evidence_result != "health_probe_reserved":
+            repository.record_health_observation(
+                running_job.job_id,
+                attempt.attempt_id,
+                evidence_result,
+                reservation.attempts,
+                evidence_result,
+                **_lease_args(running_job),
+            )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^healthy_probe_evidence_required$",
+    ):
+        repository.record_healthy(
+            running_job.job_id,
+            attempt.attempt_id,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
 
 
 def test_transition_rejects_attempt_from_another_instance_without_mutation(
@@ -851,10 +1411,20 @@ def test_transition_rejects_attempt_from_another_instance_without_mutation(
     )
     other_job = repository.claim_next_job("supervisor-2", lease_seconds=30)
     assert other_job is not None
-    other = _begin_attempt(repository, other_job.job_id, _resolved_material("b"))
+    other = _begin_attempt(
+        repository,
+        other_job.job_id,
+        _resolved_material("b"),
+        lease_owner="supervisor-2",
+        lease_generation=other_job.lease_generation,
+    )
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^job_attempt_instance_mismatch$"):
-        repository.record_healthy(running_job.job_id, other.attempt_id)
+        repository.record_healthy(
+            running_job.job_id,
+            other.attempt_id,
+            **_lease_args(running_job),
+        )
 
     assert repository.list_attempts("instance-1")[0] == first
     assert repository.list_attempts("instance-2")[0] == other
@@ -872,6 +1442,7 @@ def test_failed_attempt_latches_without_queuing_retry(
         running_job.job_id,
         attempt.attempt_id,
         "health_timeout",
+        **_lease_args(running_job),
     )
     instance, job, record = _persisted_records(engine, running_job.job_id, attempt.attempt_id)
 
@@ -885,18 +1456,267 @@ def test_failed_attempt_latches_without_queuing_retry(
     assert all(job.status != "pending" for job in repository.list_jobs(attempt.instance_id))
 
 
+def test_record_failed_preserves_durable_health_observation(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(running_job),
+    )
+    repository.record_health_observation(
+        running_job.job_id,
+        attempt.attempt_id,
+        "health_probe_unhealthy",
+        attempts=reservation.attempts,
+        last_failure_code="health_timeout",
+        **_lease_args(running_job),
+    )
+
+    repository.record_failed(
+        running_job.job_id,
+        attempt.attempt_id,
+        "health_timeout",
+        **_lease_args(running_job),
+    )
+
+    _, job, record = _persisted_records(engine, running_job.job_id, attempt.attempt_id)
+    assert job.status == "failed"
+    assert record.health_result == {
+        "profile_id": "api-ping-v1",
+        "profile_digest": "8" * 64,
+        "deadline_at": (NOW + timedelta(seconds=20)).isoformat().replace("+00:00", "Z"),
+        "next_probe_not_before": NOW.isoformat().replace("+00:00", "Z"),
+        "result_code": "health_probe_unhealthy",
+        "attempts": 1,
+        "last_failure_code": "health_timeout",
+    }
+    assert all(item.status != "pending" for item in repository.list_jobs("instance-1"))
+
+
+def test_reclaim_stale_reconciliation_job_restores_bounded_running_lease(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    clock.now += timedelta(seconds=31)
+    stale = repository.claim_next_job("supervisor-reaper", lease_seconds=30)
+    assert stale is not None
+    assert stale.status == "needs_reconciliation"
+    reclaim_time = clock.now
+
+    reclaimed = repository.reclaim_reconciliation_job(
+        running_job.job_id,
+        "supervisor-2",
+        lease_seconds=45,
+    )
+
+    assert reclaimed.status == "running"
+    assert reclaimed.lease_owner == "supervisor-2"
+    assert reclaimed.lease_generation == running_job.lease_generation + 1
+    assert reclaimed.lease_expires_at == reclaim_time + timedelta(seconds=45)
+    assert reclaimed.completed_at is None
+    assert reclaimed.failure_code is None
+    assert repository.list_attempts("instance-1")[0] == attempt
+    assert all(item.status != "pending" for item in repository.list_jobs("instance-1"))
+    with Session(engine) as session:
+        audit = session.scalars(
+            select(RuntimeAuditEventRecord).where(
+                RuntimeAuditEventRecord.request_id == running_job.job_id
+            ).order_by(
+                RuntimeAuditEventRecord.occurred_at,
+                RuntimeAuditEventRecord.audit_event_id,
+            )
+        ).all()[-1]
+    assert audit.actor_type == "supervisor-2"
+    assert audit.result_code == "reconciliation_reclaimed"
+    assert repository.assert_current_lease(
+        running_job.job_id,
+        "supervisor-2",
+        reclaimed.lease_generation,
+    ) == reclaimed
+
+
+def test_reclaimed_lease_generation_fences_the_previous_worker_atomically(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    clock.now += timedelta(seconds=31)
+    assert repository.claim_next_job("supervisor-reaper", lease_seconds=30) is not None
+    reclaimed = repository.reclaim_reconciliation_job(
+        running_job.job_id,
+        "supervisor-1",
+        lease_seconds=30,
+    )
+    assert reclaimed.lease_generation == running_job.lease_generation + 1
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^lease_generation_mismatch$"):
+        repository.record_failed(
+            running_job.job_id,
+            attempt.attempt_id,
+            "stale_worker_write",
+            lease_owner="supervisor-1",
+            lease_generation=running_job.lease_generation,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_health_observation_rollback_restores_reserved_ordinal(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    attempt = _begin_attempt(repository, running_job.job_id)
+    reservation = repository.reserve_health_probe(
+        running_job.job_id,
+        attempt.attempt_id,
+        "api-ping-v1",
+        "8" * 64,
+        NOW + timedelta(seconds=20),
+        NOW,
+        **_lease_args(running_job),
+    )
+    before = _database_snapshot(engine)
+
+    def fail_view(_record: RuntimeAttemptRecord) -> RuntimeAttemptView:
+        raise RuntimeError("injected_view_failure")
+
+    monkeypatch.setattr(repository, "_attempt_view", fail_view)
+    with pytest.raises(RuntimeError, match=r"^injected_view_failure$"):
+        repository.record_health_observation(
+            running_job.job_id,
+            attempt.attempt_id,
+            "health_probe_healthy",
+            reservation.attempts,
+            None,
+            **_lease_args(running_job),
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+@pytest.mark.parametrize("lease_seconds", [0, 3601, True, 1.0, "1"])
+def test_reclaim_reconciliation_job_rejects_invalid_lease_without_mutation(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+    lease_seconds: object,
+) -> None:
+    clock.now += timedelta(seconds=31)
+    assert repository.claim_next_job("supervisor-reaper", lease_seconds=30) is not None
+    before = _database_snapshot(engine)
+
+    with pytest.raises(RuntimeInvalidTransition, match=r"^invalid_lease_seconds$"):
+        repository.reclaim_reconciliation_job(
+            running_job.job_id,
+            "supervisor-2",
+            lease_seconds=lease_seconds,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
+def test_reclaim_reconciliation_job_rejects_non_stale_reconciliation_and_terminals(
+    engine: Engine,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    repository.record_reconciliation_blocked(
+        running_job.job_id,
+        None,
+        "identity_ambiguous",
+        **_lease_args(running_job),
+    )
+    before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^stale_lease_reconciliation_required$",
+    ):
+        repository.reclaim_reconciliation_job(
+            running_job.job_id,
+            "supervisor-2",
+            lease_seconds=30,
+        )
+    assert _database_snapshot(engine) == before
+
+    with Session(engine) as session, session.begin():
+        job = session.get(RuntimeLifecycleJobRecord, running_job.job_id)
+        assert job is not None
+        job.status = "failed"
+        job.failure_code = "stale_lease"
+    terminal_before = _database_snapshot(engine)
+
+    with pytest.raises(
+        RuntimeInvalidTransition,
+        match=r"^stale_lease_reconciliation_required$",
+    ):
+        repository.reclaim_reconciliation_job(
+            running_job.job_id,
+            "supervisor-2",
+            lease_seconds=30,
+        )
+    assert _database_snapshot(engine) == terminal_before
+
+
+def test_reclaim_reconciliation_job_rolls_back_when_audit_fails(
+    engine: Engine,
+    clock: MutableClock,
+    monkeypatch: pytest.MonkeyPatch,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    clock.now += timedelta(seconds=31)
+    assert repository.claim_next_job("supervisor-reaper", lease_seconds=30) is not None
+    before = _database_snapshot(engine)
+
+    def fail_audit(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected_audit_failure")
+
+    monkeypatch.setattr(repository, "_append_audit_record", fail_audit)
+    with pytest.raises(RuntimeError, match=r"^injected_audit_failure$"):
+        repository.reclaim_reconciliation_job(
+            running_job.job_id,
+            "supervisor-2",
+            lease_seconds=30,
+        )
+
+    assert _database_snapshot(engine) == before
+
+
 def test_record_stopped_requires_explicit_stop_job_and_transitions_all_records(
     engine: Engine,
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
     attempt = _begin_attempt(repository, running_job.job_id)
-    repository.record_healthy(running_job.job_id, attempt.attempt_id)
+    _record_healthy(repository, running_job, attempt.attempt_id)
     repository.create_job(_command("stop", "stop-1", version=1), "operator_cli")
     stop_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
     assert stop_job is not None
 
-    stopped = repository.record_stopped(stop_job.job_id, attempt.attempt_id, exit_code=0)
+    stopped = repository.record_stopped(
+        stop_job.job_id,
+        attempt.attempt_id,
+        exit_code=0,
+        **_lease_args(stop_job),
+    )
     instance, job, record = _persisted_records(engine, stop_job.job_id, attempt.attempt_id)
 
     assert stopped.status == "stopped"
@@ -912,14 +1732,24 @@ def test_record_stopped_accepts_already_absent_without_inventing_exit_code(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
-    attempt = repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
-    repository.record_healthy(running_job.job_id, attempt.attempt_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
+    attempt = repository.begin_attempt(
+        running_job.job_id,
+        attempt_id,
+        _resolved_material(),
+        **_lease_args(running_job),
+    )
+    _record_healthy(repository, running_job, attempt.attempt_id)
     repository.create_job(_command("stop", "stop-absent", version=1), "operator_cli")
     stop_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
     assert stop_job is not None
 
-    stopped = repository.record_stopped(stop_job.job_id, attempt.attempt_id, exit_code=None)
+    stopped = repository.record_stopped(
+        stop_job.job_id,
+        attempt.attempt_id,
+        exit_code=None,
+        **_lease_args(stop_job),
+    )
 
     assert stopped.status == "stopped"
     assert stopped.exit_code is None
@@ -940,14 +1770,24 @@ def test_record_stopped_rejects_non_integer_exit_codes(
     exit_code: object,
 ) -> None:
     with pytest.raises(RuntimeInvalidTransition, match=r"^invalid_exit_code$"):
-        repository.record_stopped("job-1", "attempt-1", exit_code=exit_code)
+        repository.record_stopped(
+            "job-1",
+            "attempt-1",
+            exit_code=exit_code,
+            lease_owner="supervisor-1",
+            lease_generation=1,
+        )
 
 
 def test_latch_failure_handles_current_job_without_creating_or_changing_attempt(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    failed_job = repository.latch_failure(running_job.job_id, "container_missing")
+    failed_job = repository.latch_failure(
+        running_job.job_id,
+        "container_missing",
+        **_lease_args(running_job),
+    )
 
     instance = repository.get_instance("instance-1")
     assert failed_job.status == "failed"
@@ -962,22 +1802,39 @@ def test_renew_lease_is_bounded_and_owner_safe(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    renewed = repository.renew_lease(running_job.job_id, "supervisor-1", lease_seconds=60)
+    renewed = repository.renew_lease(
+        running_job.job_id,
+        "supervisor-1",
+        running_job.lease_generation,
+        lease_seconds=60,
+    )
 
     assert renewed.lease_owner == "supervisor-1"
+    assert renewed.lease_generation == running_job.lease_generation
     assert renewed.lease_expires_at == NOW + timedelta(seconds=60)
     with pytest.raises(RuntimeInvalidTransition, match=r"^lease_owner_mismatch$"):
-        repository.renew_lease(running_job.job_id, "supervisor-2", lease_seconds=60)
+        repository.renew_lease(
+            running_job.job_id,
+            "supervisor-2",
+            running_job.lease_generation,
+            lease_seconds=60,
+        )
     for invalid_seconds in (0, 3601, True):
         with pytest.raises(RuntimeInvalidTransition, match=r"^invalid_lease_seconds$"):
             repository.renew_lease(
                 running_job.job_id,
                 "supervisor-1",
+                running_job.lease_generation,
                 lease_seconds=invalid_seconds,
             )
     clock.now += timedelta(seconds=61)
     with pytest.raises(RuntimeInvalidTransition, match=r"^lease_expired$"):
-        repository.renew_lease(running_job.job_id, "supervisor-1", lease_seconds=60)
+        repository.renew_lease(
+            running_job.job_id,
+            "supervisor-1",
+            running_job.lease_generation,
+            lease_seconds=60,
+        )
 
 
 def test_audit_failure_rolls_back_healthy_attempt_job_and_instance(
@@ -987,20 +1844,26 @@ def test_audit_failure_rolls_back_healthy_attempt_job_and_instance(
     running_job,
 ) -> None:
     attempt = _begin_attempt(repository, running_job.job_id)
+    _complete_health_probe(repository, running_job, attempt.attempt_id)
 
     def fail_audit(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("injected_audit_failure")
 
     monkeypatch.setattr(repository, "_append_audit_record", fail_audit)
     with pytest.raises(RuntimeError, match=r"^injected_audit_failure$"):
-        repository.record_healthy(running_job.job_id, attempt.attempt_id)
+        repository.record_healthy(
+            running_job.job_id,
+            attempt.attempt_id,
+            **_lease_args(running_job),
+        )
 
     instance, job, record = _persisted_records(engine, running_job.job_id, attempt.attempt_id)
     assert instance.lifecycle_status == "starting"
     assert job.status == "running"
     assert job.lease_owner == "supervisor-1"
     assert record.status == "launching"
-    assert record.health_result is None
+    assert record.health_result is not None
+    assert record.health_result["result_code"] == "health_probe_healthy"
 
 
 def test_resolved_secret_versions_are_deeply_immutable() -> None:
@@ -1105,19 +1968,25 @@ def test_latch_failure_rejects_active_attempt_without_mutation(
 ) -> None:
     attempt = _begin_attempt(repository, running_job.job_id)
     job_id = running_job.job_id
+    lease_job = running_job
     if attempt_status == "healthy":
-        repository.record_healthy(running_job.job_id, attempt.attempt_id)
+        _record_healthy(repository, running_job, attempt.attempt_id)
         repository.create_job(_command("stop", "stop-active", version=1), "operator_cli")
         stop_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
         assert stop_job is not None
         job_id = stop_job.job_id
+        lease_job = stop_job
 
     before = _database_snapshot(engine)
     with pytest.raises(
         RuntimeInvalidTransition,
         match=r"^active_attempt_requires_explicit_failure$",
     ):
-        repository.latch_failure(job_id, "container_missing")
+        repository.latch_failure(
+            job_id,
+            "container_missing",
+            **_lease_args(lease_job),
+        )
 
     assert _database_snapshot(engine) == before
 
@@ -1141,19 +2010,26 @@ def test_supervisor_transitions_validate_lease_with_post_lock_time(
     operation: str,
 ) -> None:
     job_id = running_job.job_id
+    lease_job = running_job
     attempt_id: str | None = None
     prepared_attempt_id: str | None = None
     if operation == "begin_attempt":
-        prepared_attempt_id = repository.prepare_attempt_id(job_id)
+        prepared_attempt_id = repository.prepare_attempt_id(job_id, **_lease_args(lease_job))
     if operation in {"record_healthy", "record_failed", "record_stopped"}:
         attempt = _begin_attempt(repository, running_job.job_id)
         attempt_id = attempt.attempt_id
+        _complete_health_probe(repository, running_job, attempt.attempt_id)
         if operation == "record_stopped":
-            repository.record_healthy(running_job.job_id, attempt.attempt_id)
+            repository.record_healthy(
+                running_job.job_id,
+                attempt.attempt_id,
+                **_lease_args(running_job),
+            )
             repository.create_job(_command("stop", "stop-expiry", version=1), "operator_cli")
             stop_job = repository.claim_next_job("supervisor-1", lease_seconds=30)
             assert stop_job is not None
             job_id = stop_job.job_id
+            lease_job = stop_job
 
     def invoke() -> object:
         if operation == "begin_attempt":
@@ -1161,16 +2037,36 @@ def test_supervisor_transitions_validate_lease_with_post_lock_time(
                 job_id,
                 prepared_attempt_id,
                 _resolved_material(),
+                **_lease_args(lease_job),
             )
         if operation == "record_healthy":
-            return repository.record_healthy(job_id, attempt_id)
+            return repository.record_healthy(job_id, attempt_id, **_lease_args(lease_job))
         if operation == "record_failed":
-            return repository.record_failed(job_id, attempt_id, "health_timeout")
+            return repository.record_failed(
+                job_id,
+                attempt_id,
+                "health_timeout",
+                **_lease_args(lease_job),
+            )
         if operation == "record_stopped":
-            return repository.record_stopped(job_id, attempt_id, exit_code=0)
+            return repository.record_stopped(
+                job_id,
+                attempt_id,
+                exit_code=0,
+                **_lease_args(lease_job),
+            )
         if operation == "renew_lease":
-            return repository.renew_lease(job_id, "supervisor-1", lease_seconds=30)
-        return repository.latch_failure(job_id, "container_missing")
+            return repository.renew_lease(
+                job_id,
+                "supervisor-1",
+                lease_job.lease_generation,
+                lease_seconds=30,
+            )
+        return repository.latch_failure(
+            job_id,
+            "container_missing",
+            **_lease_args(lease_job),
+        )
 
     before = _database_snapshot(engine)
     clock.set_sequence(NOW, NOW + timedelta(seconds=31))
@@ -1210,11 +2106,14 @@ def test_new_supervisor_transitions_validate_lease_with_post_lock_time(
 ) -> None:
     def invoke() -> object:
         if operation == "prepare_attempt_id":
-            return repository.prepare_attempt_id(running_job.job_id)
+            return repository.prepare_attempt_id(
+                running_job.job_id, **_lease_args(running_job)
+            )
         return repository.record_reconciliation_blocked(
             running_job.job_id,
             None,
             "identity_ambiguous",
+            **_lease_args(running_job),
         )
 
     before = _database_snapshot(engine)
@@ -1260,9 +2159,52 @@ def test_complete_job_cannot_bypass_running_attempt_transition(
     before = _database_snapshot(engine)
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^attempt_transition_required$"):
-        repository.complete_job(running_job.job_id, status, failure_code)
+        repository.complete_job(
+            running_job.job_id,
+            status,
+            failure_code,
+            **_lease_args(running_job),
+        )
 
     assert _database_snapshot(engine) == before
+
+
+def test_complete_job_samples_expiry_after_the_job_lock(
+    engine: Engine,
+    clock: MutableClock,
+    repository: SqlRuntimeRepository,
+    running_job,
+) -> None:
+    clock.set_sequence(NOW, NOW + timedelta(seconds=31))
+    lock_query_seen = False
+
+    def consume_time_while_waiting_for_lock(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        nonlocal lock_query_seen
+        if not lock_query_seen and "FROM runtime_lifecycle_jobs" in statement:
+            lock_query_seen = True
+            clock()
+
+    event.listen(engine, "before_cursor_execute", consume_time_while_waiting_for_lock)
+    try:
+        completed = repository.complete_job(
+            running_job.job_id,
+            "succeeded",
+            None,
+            **_lease_args(running_job),
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", consume_time_while_waiting_for_lock)
+
+    assert lock_query_seen is True
+    assert completed.status == "needs_reconciliation"
+    assert completed.failure_code == "stale_lease"
 
 
 def test_begin_attempt_locks_exact_provenance_rows_in_fixed_order(
@@ -1335,7 +2277,7 @@ def test_begin_attempt_validates_lease_after_secret_version_lock(
     repository: SqlRuntimeRepository,
     running_job,
 ) -> None:
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
     before = _database_snapshot(engine)
     clock.set_sequence(NOW, NOW + timedelta(seconds=31))
     version_query_seen = False
@@ -1356,7 +2298,12 @@ def test_begin_attempt_validates_lease_after_secret_version_lock(
     event.listen(engine, "after_cursor_execute", consume_time_after_version_query)
     try:
         with pytest.raises(RuntimeInvalidTransition, match=r"^lease_expired$"):
-            repository.begin_attempt(running_job.job_id, attempt_id, _resolved_material())
+            repository.begin_attempt(
+                running_job.job_id,
+                attempt_id,
+                _resolved_material(),
+                **_lease_args(running_job),
+            )
     finally:
         event.remove(engine, "after_cursor_execute", consume_time_after_version_query)
 
@@ -1372,9 +2319,18 @@ def test_pre_attempt_supervisor_audit_uses_runtime_spec_template_binding(
     operation: str,
 ) -> None:
     if operation == "renew_lease":
-        repository.renew_lease(running_job.job_id, "supervisor-1", lease_seconds=60)
+        repository.renew_lease(
+            running_job.job_id,
+            "supervisor-1",
+            running_job.lease_generation,
+            lease_seconds=60,
+        )
     else:
-        repository.latch_failure(running_job.job_id, "container_missing")
+        repository.latch_failure(
+            running_job.job_id,
+            "container_missing",
+            **_lease_args(running_job),
+        )
 
     with Session(engine) as session:
         audit = session.scalars(
@@ -1414,7 +2370,7 @@ def test_postgres_begin_waits_for_retired_version_then_rejects_without_transitio
     postgres_engine: Engine,
 ) -> None:
     repository, running_job = _postgres_running_repository(postgres_engine)
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         with Session(postgres_engine) as writer, writer.begin():
@@ -1435,6 +2391,8 @@ def test_postgres_begin_waits_for_retired_version_then_rejects_without_transitio
                 running_job.job_id,
                 attempt_id,
                 _resolved_material(),
+                running_job.lease_owner,
+                running_job.lease_generation,
             )
             with pytest.raises(FutureTimeoutError):
                 future.result(timeout=0.2)
@@ -1462,7 +2420,7 @@ def test_postgres_begin_linearizes_before_template_revoke_writer(
     postgres_engine: Engine,
 ) -> None:
     repository, running_job = _postgres_running_repository(postgres_engine)
-    attempt_id = repository.prepare_attempt_id(running_job.job_id)
+    attempt_id = repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job))
     provenance_locked = Event()
     release_begin = Event()
 
@@ -1488,6 +2446,8 @@ def test_postgres_begin_linearizes_before_template_revoke_writer(
             running_job.job_id,
             attempt_id,
             _resolved_material(),
+            running_job.lease_owner,
+            running_job.lease_generation,
         )
         assert provenance_locked.wait(timeout=5)
         revoke_future = executor.submit(
@@ -1516,8 +2476,8 @@ def test_postgres_two_prepared_candidates_create_at_most_one_active_attempt(
 ) -> None:
     repository, running_job = _postgres_running_repository(postgres_engine)
     attempt_ids = (
-        repository.prepare_attempt_id(running_job.job_id),
-        repository.prepare_attempt_id(running_job.job_id),
+        repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job)),
+        repository.prepare_attempt_id(running_job.job_id, **_lease_args(running_job)),
     )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1527,6 +2487,8 @@ def test_postgres_two_prepared_candidates_create_at_most_one_active_attempt(
                 running_job.job_id,
                 attempt_id,
                 _resolved_material(),
+                running_job.lease_owner,
+                running_job.lease_generation,
             )
             for attempt_id in attempt_ids
         )

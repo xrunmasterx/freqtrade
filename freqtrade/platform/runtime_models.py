@@ -139,6 +139,10 @@ class RuntimeLifecycleJobRecord(PlatformBase):
             name="ck_runtime_lifecycle_jobs_expected_instance_version",
         ),
         CheckConstraint(
+            "lease_generation >= 0",
+            name="ck_runtime_lifecycle_jobs_lease_generation",
+        ),
+        CheckConstraint(
             "status IN "
             "('pending', 'claimed', 'running', 'succeeded', 'failed', 'needs_reconciliation')",
             name="ck_runtime_lifecycle_jobs_status",
@@ -160,6 +164,7 @@ class RuntimeLifecycleJobRecord(PlatformBase):
     expected_instance_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

@@ -803,14 +803,22 @@ def test_complete_job_enforces_failure_code_and_late_completion(
     assert claimed is not None
 
     with pytest.raises(RuntimeInvalidTransition, match=r"^success_failure_code_forbidden$"):
-        repository.complete_job(claimed.job_id, "succeeded", "failure")
+        repository.complete_job(
+            claimed.job_id, "succeeded", "failure", "supervisor-a", claimed.lease_generation
+        )
     with pytest.raises(RuntimeInvalidTransition, match=r"^failure_code_required$"):
-        repository.complete_job(claimed.job_id, "failed", None)
+        repository.complete_job(
+            claimed.job_id, "failed", None, "supervisor-a", claimed.lease_generation
+        )
     with pytest.raises(RuntimeInvalidTransition, match=r"^invalid_completion_status$"):
-        repository.complete_job(claimed.job_id, "running", None)
+        repository.complete_job(
+            claimed.job_id, "running", None, "supervisor-a", claimed.lease_generation
+        )
 
     clock.now += timedelta(seconds=11)
-    completed = repository.complete_job(claimed.job_id, "succeeded", None)
+    completed = repository.complete_job(
+        claimed.job_id, "succeeded", None, "supervisor-a", claimed.lease_generation
+    )
     assert completed.status == "needs_reconciliation"
     assert completed.failure_code == "stale_lease"
     assert completed.lease_owner is None
@@ -839,6 +847,8 @@ def test_postgres_late_completion_requires_reconciliation(
         claimed.job_id,
         requested_status,
         requested_failure_code,
+        "supervisor-a",
+        claimed.lease_generation,
     )
 
     assert completed.status == "needs_reconciliation"
@@ -873,13 +883,19 @@ def test_success_and_failure_completion_are_terminal(
     second = repository.claim_next_job("supervisor-b", 30)
     assert first is not None and second is not None
 
-    succeeded = repository.complete_job(first.job_id, "succeeded", None)
-    failed = repository.complete_job(second.job_id, "failed", "launch_failed")
+    succeeded = repository.complete_job(
+        first.job_id, "succeeded", None, "supervisor-a", first.lease_generation
+    )
+    failed = repository.complete_job(
+        second.job_id, "failed", "launch_failed", "supervisor-b", second.lease_generation
+    )
 
     assert succeeded.status == "succeeded" and succeeded.failure_code is None
     assert failed.status == "failed" and failed.failure_code == "launch_failed"
     with pytest.raises(RuntimeInvalidTransition, match=r"^job_not_completable$"):
-        repository.complete_job(first.job_id, "succeeded", None)
+        repository.complete_job(
+            first.job_id, "succeeded", None, "supervisor-a", first.lease_generation
+        )
 
 
 def test_append_audit_accepts_only_closed_non_secret_input(

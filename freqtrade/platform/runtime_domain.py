@@ -119,6 +119,7 @@ class RuntimeJobView(_RuntimeDomainModel):
     expected_instance_version: int = Field(ge=0)
     status: RuntimeJobStatus
     lease_owner: Identifier | None
+    lease_generation: int = Field(ge=0)
     lease_expires_at: AwareDatetime | None
     requested_at: AwareDatetime
     started_at: AwareDatetime | None
