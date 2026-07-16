@@ -55,6 +55,7 @@ _AUDIT_SOURCE = "runtime_repository"
 _ViewT = TypeVar("_ViewT")
 _CommitIdentity = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 _ImageIdentity = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+_PayloadDigest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class RuntimeNotFound(RuntimeError):
@@ -139,6 +140,13 @@ class ResolvedRuntimeMaterial(_RuntimeRepositoryInput):
         return value
 
 
+class LatestAttemptMaterial(_RuntimeRepositoryInput):
+    attempt_id: Identifier
+    status: RuntimeAttemptStatus
+    runtime_spec_payload_digest: _PayloadDigest
+    resolved_material: ResolvedRuntimeMaterial
+
+
 @runtime_checkable
 class RuntimeQueryRepository(Protocol):
     def get_instance(self, instance_id: Identifier) -> RuntimeInstanceView: ...
@@ -148,6 +156,11 @@ class RuntimeQueryRepository(Protocol):
     def list_attempts(self, instance_id: Identifier) -> tuple[RuntimeAttemptView, ...]: ...
 
     def list_jobs(self, instance_id: Identifier) -> tuple[RuntimeJobView, ...]: ...
+
+    def get_latest_attempt_material(
+        self,
+        instance_id: Identifier,
+    ) -> LatestAttemptMaterial | None: ...
 
 
 @runtime_checkable
@@ -174,8 +187,18 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
     def begin_attempt(
         self,
         job_id: Identifier,
+        attempt_id: Identifier,
         resolved_material: ResolvedRuntimeMaterial,
     ) -> RuntimeAttemptView: ...
+
+    def prepare_attempt_id(self, job_id: Identifier) -> Identifier: ...
+
+    def record_reconciliation_blocked(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier | None,
+        failure_code: Identifier,
+    ) -> RuntimeJobView: ...
 
     def record_healthy(
         self,
@@ -194,7 +217,7 @@ class RuntimeRepository(RuntimeQueryRepository, Protocol):
         self,
         job_id: Identifier,
         attempt_id: Identifier,
-        exit_code: int,
+        exit_code: int | None,
     ) -> RuntimeAttemptView: ...
 
     def renew_lease(
@@ -303,6 +326,51 @@ class SqlRuntimeRepository:
                 )
             )
             return tuple(self._job_view(record) for record in records)
+
+    def get_latest_attempt_material(
+        self,
+        instance_id: Identifier,
+    ) -> LatestAttemptMaterial | None:
+        validated_instance_id = _IDENTIFIER_ADAPTER.validate_python(instance_id)
+        with Session(self._engine) as session:
+            self._require_instance(session, validated_instance_id)
+            attempt = session.scalar(
+                select(RuntimeAttemptRecord)
+                .where(RuntimeAttemptRecord.instance_id == validated_instance_id)
+                .order_by(
+                    RuntimeAttemptRecord.attempt_number.desc(),
+                    RuntimeAttemptRecord.attempt_id.desc(),
+                )
+                .limit(1)
+            )
+            if attempt is None:
+                return None
+            runtime_spec = session.get(
+                RuntimeSpecRevisionRecord,
+                attempt.runtime_spec_revision_id,
+            )
+            if runtime_spec is None:
+                raise RuntimeDataError("runtime_spec_not_found")
+            return _registry_view(
+                lambda: LatestAttemptMaterial(
+                    attempt_id=attempt.attempt_id,
+                    status=RuntimeAttemptStatus(attempt.status),
+                    runtime_spec_payload_digest=runtime_spec.payload_digest,
+                    resolved_material=ResolvedRuntimeMaterial(
+                        runtime_spec_revision_id=attempt.runtime_spec_revision_id,
+                        adapter_template_revision_id=attempt.adapter_template_revision_id,
+                        state_allocation_id=runtime_spec.state_allocation_id,
+                        resolved_secret_versions=attempt.resolved_secret_versions,
+                        image_id=attempt.image_id,
+                        root_commit=attempt.root_commit,
+                        backend_commit=attempt.backend_commit,
+                        frontend_commit=attempt.frontend_commit,
+                        strategies_commit=attempt.strategies_commit,
+                        project_identity=attempt.project_identity,
+                        container_identity=attempt.container_identity,
+                    ),
+                )
+            )
 
     def create_job(
         self,
@@ -486,11 +554,25 @@ class SqlRuntimeRepository:
             self._append_job_audit(session, job, actor, status, now)
             return self._job_view(job)
 
+    def prepare_attempt_id(self, job_id: Identifier) -> Identifier:
+        with Session(self._engine) as session, session.begin():
+            job, instance = self._lock_job_and_instance(session, job_id)
+            active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            now = self._now()
+            self._require_current_lease(job, now)
+            if job.requested_action not in {"start", "retry"}:
+                raise RuntimeInvalidTransition("attempt_requires_start_or_retry_job")
+            if active_attempt is not None:
+                raise RuntimeInvalidTransition("active_attempt_exists")
+        return self._new_id("attempt")
+
     def begin_attempt(
         self,
         job_id: Identifier,
+        attempt_id: Identifier,
         resolved_material: ResolvedRuntimeMaterial,
     ) -> RuntimeAttemptView:
+        validated_attempt_id = _IDENTIFIER_ADAPTER.validate_python(attempt_id)
         if not isinstance(resolved_material, ResolvedRuntimeMaterial):
             raise RuntimeInvalidTransition("resolved_material_type_required")
         validated_material = self._revalidate_resolved_material(resolved_material)
@@ -504,6 +586,8 @@ class SqlRuntimeRepository:
                 raise RuntimeInvalidTransition("attempt_requires_start_or_retry_job")
             if active_attempt is not None:
                 raise RuntimeInvalidTransition("active_attempt_exists")
+            if session.get(RuntimeAttemptRecord, validated_attempt_id) is not None:
+                raise RuntimeInvalidTransition("attempt_id_exists")
 
             attempt_number = (
                 session.scalar(
@@ -517,7 +601,7 @@ class SqlRuntimeRepository:
             instance.lifecycle_status = "starting"
             job.status = "running"
             attempt = RuntimeAttemptRecord(
-                attempt_id=self._new_id("attempt"),
+                attempt_id=validated_attempt_id,
                 instance_id=instance.instance_id,
                 attempt_number=attempt_number,
                 runtime_spec_revision_id=validated_material.runtime_spec_revision_id,
@@ -622,13 +706,65 @@ class SqlRuntimeRepository:
             )
             return self._attempt_view(attempt)
 
+    def record_reconciliation_blocked(
+        self,
+        job_id: Identifier,
+        attempt_id: Identifier | None,
+        failure_code: Identifier,
+    ) -> RuntimeJobView:
+        validated_attempt_id = (
+            _IDENTIFIER_ADAPTER.validate_python(attempt_id) if attempt_id is not None else None
+        )
+        validated_failure_code = _IDENTIFIER_ADAPTER.validate_python(failure_code)
+        with Session(self._engine, expire_on_commit=False) as session, session.begin():
+            job, instance = self._lock_job_and_instance(session, job_id)
+            active_attempt = self._lock_active_attempt(session, instance.instance_id)
+            now = self._now()
+            actor = self._require_current_lease(job, now)
+            if (
+                (active_attempt is None and validated_attempt_id is not None)
+                or (
+                    active_attempt is not None
+                    and active_attempt.attempt_id != validated_attempt_id
+                )
+            ):
+                raise RuntimeInvalidTransition("active_attempt_binding_mismatch")
+
+            adapter_template_revision_id = (
+                active_attempt.adapter_template_revision_id
+                if active_attempt is not None
+                else self._runtime_spec_template_binding(session, instance)
+            )
+            previous_state = self._audit_state(instance)
+            instance.lifecycle_status = "failed"
+            instance.failure_latched = True
+            job.status = "needs_reconciliation"
+            job.completed_at = now
+            job.failure_code = validated_failure_code
+            job.lease_owner = None
+            job.lease_expires_at = None
+            self._append_supervisor_audit(
+                session,
+                job,
+                instance,
+                actor,
+                adapter_template_revision_id,
+                previous_state,
+                self._audit_state(instance),
+                validated_failure_code,
+                now,
+            )
+            return self._job_view(job)
+
     def record_stopped(
         self,
         job_id: Identifier,
         attempt_id: Identifier,
-        exit_code: int,
+        exit_code: int | None,
     ) -> RuntimeAttemptView:
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        if exit_code is not None and (
+            not isinstance(exit_code, int) or isinstance(exit_code, bool)
+        ):
             raise RuntimeInvalidTransition("invalid_exit_code")
         with Session(self._engine, expire_on_commit=False) as session, session.begin():
             job, instance, attempt = self._lock_transition_records(session, job_id, attempt_id)
@@ -655,7 +791,7 @@ class SqlRuntimeRepository:
                 attempt.adapter_template_revision_id,
                 previous_state,
                 self._audit_state(instance),
-                "stopped",
+                "container_already_absent" if exit_code is None else "stopped",
                 now,
             )
             return self._attempt_view(attempt)
